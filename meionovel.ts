@@ -111,12 +111,200 @@ const rankContainers = ($: CheerioAPI) => {
 const escapeHtml = (text: string) =>
   text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
+const apiHeaders = (referer: string): Record<string, string> => ({
+  Accept: "application/json, text/plain, */*",
+  "X-Requested-With": "XMLHttpRequest",
+  Referer: referer,
+});
+
+const jsonChaptersOf = (json: unknown, base: string, novelSlug: string) => {
+  const out: { path: string; name?: string }[] = [];
+  const nameKeys = ["title", "name", "chapter_title", "chapter_name", "label"];
+  const pathKeys = [
+    "url",
+    "href",
+    "link",
+    "path",
+    "permalink",
+    "slug",
+    "chapter_slug",
+  ];
+  const walk = (node: unknown) => {
+    if (Array.isArray(node)) {
+      node.forEach(walk);
+      return;
+    }
+    if (!node || typeof node !== "object") return;
+    const obj = node as Record<string, unknown>;
+    let path: string | undefined;
+    for (const key of pathKeys) {
+      const value = obj[key];
+      if (typeof value !== "string" || !value) continue;
+      const normalized = normalizePath(value);
+      if (normalized.startsWith(base)) {
+        path = normalized;
+        break;
+      }
+      if (
+        key.includes("slug") &&
+        value !== novelSlug &&
+        /^[A-Za-z0-9_\-]+$/.test(value)
+      ) {
+        path = `${base}${value}`;
+        break;
+      }
+    }
+    if (path) {
+      const nameKey = nameKeys.find((k) => typeof obj[k] === "string" && obj[k]);
+      out.push({ path, name: nameKey ? String(obj[nameKey]) : undefined });
+    }
+    Object.values(obj).forEach(walk);
+  };
+  walk(json);
+  return out;
+};
+
+const contentFromJson = (json: unknown): string => {
+  let bestString = "";
+  let bestArray = "";
+  const walk = (node: unknown) => {
+    if (typeof node === "string") {
+      if (node.length > bestString.length) bestString = node;
+    } else if (Array.isArray(node)) {
+      if (node.length > 3 && node.every((item) => typeof item === "string")) {
+        const joined = (node as string[]).join("\n\n");
+        if (joined.length > bestArray.length) bestArray = joined;
+      }
+      node.forEach(walk);
+    } else if (node && typeof node === "object") {
+      Object.values(node as Record<string, unknown>).forEach(walk);
+    }
+  };
+  walk(json);
+  return bestArray.length > bestString.length ? bestArray : bestString;
+};
+
+const contentToHtml = (content: string) =>
+  /<p[\s>]/i.test(content)
+    ? content
+    : content
+        .split(/\r?\n\s*\r?\n|\r?\n/)
+        .map((block) => block.trim())
+        .filter(Boolean)
+        .map((block) => `<p>${escapeHtml(block)}</p>`)
+        .join("");
+
+const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+const b64decode = (input: string): Uint8Array => {
+  const clean = input.replace(/[^A-Za-z0-9+/]/g, "");
+  const out = new Uint8Array(Math.floor((clean.length * 3) / 4));
+  let buffer = 0;
+  let bits = 0;
+  let index = 0;
+  for (let i = 0; i < clean.length; i++) {
+    buffer = (buffer << 6) | B64.indexOf(clean.charAt(i));
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out[index++] = (buffer >> bits) & 0xff;
+    }
+  }
+  return out;
+};
+
+const utf8Decode = (bytes: Uint8Array): string => {
+  let out = "";
+  let i = 0;
+  while (i < bytes.length) {
+    const b = bytes[i++];
+    if (b < 0x80) {
+      out += String.fromCharCode(b);
+    } else if (b >= 0xc0 && b < 0xe0) {
+      out += String.fromCharCode(((b & 0x1f) << 6) | (bytes[i++] & 0x3f));
+    } else if (b >= 0xe0 && b < 0xf0) {
+      out += String.fromCharCode(
+        ((b & 0x0f) << 12) | ((bytes[i++] & 0x3f) << 6) | (bytes[i++] & 0x3f),
+      );
+    } else if (b >= 0xf0 && b < 0xf8) {
+      const cp =
+        ((b & 0x07) << 18) |
+        ((bytes[i++] & 0x3f) << 12) |
+        ((bytes[i++] & 0x3f) << 6) |
+        (bytes[i++] & 0x3f);
+      const v = cp - 0x10000;
+      out += String.fromCharCode(0xd800 + (v >> 10), 0xdc00 + (v & 0x3ff));
+    } else {
+      out += "\ufffd";
+    }
+  }
+  return out;
+};
+
+// Salinan logika go() di app.js situs: {k: kunci base64, p: [[offset, base64], ...]}
+const decodePayload = (data: { k: string; p: [number, string][] }): string => {
+  const key = b64decode(String(data.k));
+  const parts = data.p
+    .slice()
+    .sort((a, b) => Number(a[0]) - Number(b[0]))
+    .map(([offset, chunk]) => ({ offset: Number(offset), bytes: b64decode(chunk) }));
+  let total = 0;
+  parts.forEach((part) => (total += part.bytes.length));
+  const all = new Uint8Array(total);
+  let position = 0;
+  parts.forEach((part) => {
+    for (let o = 0; o < part.bytes.length; o++) {
+      all[position++] = key.length
+        ? part.bytes[o] ^ key[(o + part.offset) % key.length]
+        : part.bytes[o];
+    }
+  });
+  return utf8Decode(all);
+};
+
+const decodeJs = (value: string) =>
+  value
+    .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) =>
+      String.fromCharCode(parseInt(hex, 16)),
+    )
+    .replace(/\\\//g, "/")
+    .replace(/\\"/g, '"')
+    .replace(/\\\\/g, "\\");
+
+// Baca konfigurasi gaya {key: "nilai", key2: 123} dari atribut x-data / script
+const readConfig = (source: string, keys: string[]): Record<string, string> => {
+  const text = source
+    .replace(/\\u0022/gi, '"')
+    .replace(/\\u0027/gi, "'")
+    .replace(/\\u0026/gi, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;/g, "'")
+    .replace(/&amp;/g, "&");
+  const out: Record<string, string> = {};
+  keys.forEach((key) => {
+    const re = new RegExp(
+      "(?:^|[^A-Za-z0-9_$])[\"']?" +
+        key +
+        "[\"']?\\s*:\\s*(?:\"((?:[^\"\\\\]|\\\\.)*)\"|'((?:[^'\\\\]|\\\\.)*)'|(-?\\d+(?:\\.\\d+)?)|(null|true|false))",
+    );
+    const match = re.exec(text);
+    if (!match) return;
+    if (match[1] !== undefined) out[key] = decodeJs(match[1]);
+    else if (match[2] !== undefined) out[key] = decodeJs(match[2]);
+    else if (match[3] !== undefined) out[key] = match[3];
+  });
+  return out;
+};
+
+const asIdValue = (value: string | undefined): string | number | undefined =>
+  value === undefined ? undefined : /^-?\d+$/.test(value) ? Number(value) : value;
+
 class MeioNovelCustomPlugin implements Plugin.PluginBase {
   id = "meionovel";
   name = "MeioNovel Custom";
   icon = "src/id/meionovel/icon.png";
   site = SITE;
-  version = "3.0.8";
+  version = "3.1.0";
   imageRequestInit: Plugin.ImageRequestInit = {
     headers: { Referer: SITE },
   };
@@ -387,6 +575,16 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
 
     known.forEach((chapter) => add(chapter.path, chapter.name));
 
+    if (/^\s*[\[{]/.test(html)) {
+      try {
+        jsonChaptersOf(JSON.parse(html), base, slug).forEach((item) =>
+          add(item.path, item.name),
+        );
+      } catch (error) {
+        // bukan JSON utuh, lanjut ke regex di bawah
+      }
+    }
+
     const $ = parseHTML(html);
     $("a[href]").each((_, element) => {
       const link = $(element);
@@ -426,13 +624,301 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
     }));
   }
 
-  private async getText(url: string): Promise<string> {
+  private async getText(
+    url: string,
+    extra?: Record<string, string>,
+  ): Promise<string> {
     try {
-      const response = await fetchApi(url, { headers: REQUEST_HEADERS });
+      const response = await fetchApi(url, {
+        headers: { ...REQUEST_HEADERS, ...(extra || {}) },
+      });
       return response.ok ? await response.text() : "";
     } catch (error) {
       return "";
     }
+  }
+
+  private endpointCandidates(rawHtml: string): string[] {
+    const $ = parseHTML(rawHtml);
+    const found: string[] = [];
+    const asset =
+      /\.(css|js|mjs|png|jpe?g|gif|svg|webp|avif|ico|woff2?|ttf|otf|map|mp3|mp4)(\?|$)/i;
+    const bad =
+      /logout|delete|destroy|bookmark|favorit|like|vote|report|comment|login|register|password|csrf|search|epub|pdf|download|theme|locale|language|subscribe|rating|notification|history|progress|setting|profile|account|storage/i;
+    const push = (value: string) => {
+      const v = value.trim();
+      if (
+        !/^(https?:\/\/(www\.)?meionovels\.com)?\/[A-Za-z0-9_\-\/.%?=&:]*$/i.test(
+          v,
+        )
+      ) {
+        return;
+      }
+      if (v === "/" || asset.test(v) || bad.test(v)) return;
+      const abs = absoluteUrl(v);
+      if (!found.includes(abs)) found.push(abs);
+    };
+    $("*").each((_, element) => {
+      const attribs = ((element as unknown) as { attribs?: Record<string, string> })
+        .attribs;
+      if (!attribs) return;
+      for (const name of Object.keys(attribs)) {
+        if (!/^(data-|x-|hx-|@|:|action$|formaction$)/i.test(name)) continue;
+        const value = String(attribs[name]);
+        push(value);
+        const re = /['"](\/[A-Za-z0-9_\-\/.%?=&:]+)['"]/g;
+        let match: RegExpExecArray | null;
+        while ((match = re.exec(value))) push(match[1]);
+      }
+    });
+    return found.slice(0, 16);
+  }
+
+  private async chaptersFromEndpoints(
+    rawHtmls: string[],
+    cleanPath: string,
+    referer: string,
+    known: Plugin.ChapterItem[],
+  ): Promise<Plugin.ChapterItem[]> {
+    const urls: string[] = [];
+    rawHtmls.forEach((html) =>
+      this.endpointCandidates(html).forEach((url) => {
+        if (!urls.includes(url)) urls.push(url);
+      }),
+    );
+    for (const url of urls.slice(0, 14)) {
+      const text = await this.getText(url, apiHeaders(referer));
+      if (!text || !/^\s*[\[{]/.test(text)) continue;
+      let found = this.discoverChapters(text, cleanPath, known);
+      if (found.length < 3) continue;
+
+      // paginasi gaya Laravel: ikuti next_page_url sampai habis
+      let json: any;
+      try {
+        json = JSON.parse(text);
+      } catch (error) {
+        json = undefined;
+      }
+      let next: unknown =
+        json?.next_page_url ||
+        json?.links?.next ||
+        json?.meta?.next ||
+        json?.pagination?.next_page_url;
+      for (let i = 0; typeof next === "string" && next && i < 400; i++) {
+        const pageText = await this.getText(
+          absoluteUrl(next),
+          apiHeaders(referer),
+        );
+        if (!pageText) break;
+        found = this.discoverChapters(pageText, cleanPath, found);
+        try {
+          const pageJson = JSON.parse(pageText);
+          next =
+            pageJson?.next_page_url ||
+            pageJson?.links?.next ||
+            pageJson?.meta?.next ||
+            pageJson?.pagination?.next_page_url;
+        } catch (error) {
+          break;
+        }
+      }
+      return found;
+    }
+    return known;
+  }
+
+  private async contentFromEndpoints(
+    rawHtml: string,
+    pageUrl: string,
+  ): Promise<{ html?: string; log: string[] }> {
+    const log: string[] = [];
+    for (const url of this.endpointCandidates(rawHtml).slice(0, 12)) {
+      const label = url.replace(SITE, "/").slice(0, 60);
+      const text = await this.getText(url, apiHeaders(pageUrl));
+      if (!text) {
+        log.push(`${label}:empty`);
+        continue;
+      }
+      let json: unknown;
+      try {
+        json = JSON.parse(text);
+      } catch (error) {
+        log.push(`${label}:html${text.length}`);
+        continue;
+      }
+      const content = contentFromJson(json);
+      log.push(`${label}:json${content.length}`);
+      if (content.length >= 600 && !PLACEHOLDER_RE.test(content)) {
+        return { html: contentToHtml(content), log };
+      }
+    }
+    return { log };
+  }
+
+  private async postJson(
+    url: string,
+    body: unknown,
+    csrf: string,
+    referer: string,
+  ): Promise<{ ok: boolean; status: number; data: any }> {
+    try {
+      const response = await fetchApi(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          "X-CSRF-TOKEN": csrf,
+          "X-Requested-With": "XMLHttpRequest",
+          Referer: referer,
+          Origin: SITE.replace(/\/+$/, ""),
+        },
+        body: JSON.stringify(body),
+      });
+      let data: any = {};
+      try {
+        data = JSON.parse(await response.text());
+      } catch (error) {
+        data = {};
+      }
+      return { ok: response.ok, status: response.status, data };
+    } catch (error) {
+      return { ok: false, status: 0, data: {} };
+    }
+  }
+
+  // Isi chapter: POST contentUrl {chapter, token} -> {k, p} -> XOR -> HTML
+  private async contentViaApi(
+    rawHtml: string,
+    pageUrl: string,
+  ): Promise<{ html?: string; log: string }> {
+    let html = rawHtml;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const $ = parseHTML(html);
+      const xdata = $('[x-data*="reader"]').first().attr("x-data") || "";
+      let cfg = readConfig(xdata, ["contentUrl", "contentToken", "chapterId"]);
+      if (!cfg.contentUrl || !cfg.contentToken) {
+        cfg = readConfig(html, ["contentUrl", "contentToken", "chapterId"]);
+      }
+      if (!cfg.contentUrl || !cfg.contentToken) {
+        return {
+          log: `cfg-missing url=${!!cfg.contentUrl} token=${!!cfg.contentToken} xdata=${xdata.slice(0, 160)}`,
+        };
+      }
+      const csrf = $('meta[name="csrf-token"]').attr("content") || "";
+      const res = await this.postJson(
+        absoluteUrl(cfg.contentUrl),
+        { chapter: asIdValue(cfg.chapterId), token: cfg.contentToken },
+        csrf,
+        pageUrl,
+      );
+      if (res.ok && res.data && res.data.k && Array.isArray(res.data.p)) {
+        const decoded = decodePayload(res.data);
+        if (decoded.replace(/<[^>]+>/g, "").trim().length > 0) {
+          return { html: decoded, log: "ok" };
+        }
+        return { log: "decoded-empty" };
+      }
+      if (res.status === 419 && attempt === 0) {
+        html = (await this.getHtml(pageUrl)).html; // segarkan sesi + token lalu coba lagi
+        continue;
+      }
+      return {
+        log: `post ${res.status} keys=${Object.keys(res.data || {}).join(",")} msg=${String(res.data?.pesan || "").slice(0, 80)}`,
+      };
+    }
+    return { log: "retry-exhausted" };
+  }
+
+  // Daftar chapter: POST {novel, token, params} -> {html} (berpaginasi lewat params.page)
+  private async chaptersViaApi(
+    pageHtml: string,
+    cleanPath: string,
+    novelUrl: string,
+  ): Promise<Plugin.ChapterItem[]> {
+    const attempt = async (
+      html: string,
+      referer: string,
+    ): Promise<Plugin.ChapterItem[]> => {
+      const $ = parseHTML(html);
+      const csrf = $('meta[name="csrf-token"]').attr("content") || "";
+      let url = "";
+      let makeBody: (params: Record<string, string>) => unknown = () => ({});
+
+      const listX = $('[x-data*="chapterList"]').first().attr("x-data") || "";
+      let list = readConfig(listX || html, ["url", "novel", "token"]);
+      if (list.url && list.token && list.novel) {
+        url = absoluteUrl(list.url);
+        makeBody = (params) => ({
+          novel: asIdValue(list.novel),
+          token: list.token,
+          params,
+        });
+      } else {
+        const readerX = $('[x-data*="reader"]').first().attr("x-data") || "";
+        list = readConfig(readerX || html, [
+          "listUrl",
+          "listToken",
+          "novelId",
+          "chapterId",
+        ]);
+        if (!list.listUrl || !list.listToken) return [];
+        url = absoluteUrl(list.listUrl);
+        makeBody = () => ({
+          novel: asIdValue(list.novelId),
+          chapter: asIdValue(list.chapterId),
+          token: list.listToken,
+        });
+      }
+
+      const first = await this.postJson(url, makeBody({}), csrf, referer);
+      if (first.status === 419) return [];
+      if (!first.ok || typeof first.data?.html !== "string") return [];
+
+      let found = this.discoverChapters(first.data.html, cleanPath, []);
+      const pageNumbers = (first.data.html.match(/[?&]page=(\d+)/g) || []).map(
+        (m: string) => Number(m.replace(/\D/g, "")),
+      );
+      let maxPage = Math.max.apply(null, [1].concat(pageNumbers));
+      ["last_page", "total_pages", "pages", "page_count", "max_page"].forEach(
+        (key) => {
+          const value = Number(first.data[key]);
+          if (value > maxPage) maxPage = value;
+        },
+      );
+
+      let limit = maxPage > 1 ? maxPage : 2;
+      for (let page = 2; page <= Math.min(limit, 600); page++) {
+        const res = await this.postJson(
+          url,
+          makeBody({ page: String(page) }),
+          csrf,
+          referer,
+        );
+        if (!res.ok || typeof res.data?.html !== "string") break;
+        const merged = this.discoverChapters(res.data.html, cleanPath, found);
+        if (merged.length <= found.length) break; // tidak ada chapter baru
+        found = merged;
+        if (maxPage <= 1) limit = page + 1; // jumlah halaman tidak diketahui
+      }
+      return found;
+    };
+
+    let chapters = await attempt(pageHtml, novelUrl);
+    if (!chapters.length) {
+      // sesi/token mungkin kedaluwarsa: ambil halaman segar sekali lagi
+      const fresh = await this.getHtml(novelUrl);
+      chapters = await attempt(fresh.html, novelUrl);
+    }
+    if (!chapters.length) {
+      // cadangan: daftar isi dari halaman chapter pertama
+      const firstPath = this.discoverChapters(pageHtml, cleanPath, [])[0]?.path;
+      if (firstPath) {
+        const chapterUrl = `${SITE}${firstPath}/`;
+        const chapterPage = await this.getHtml(chapterUrl);
+        chapters = await attempt(chapterPage.html, chapterUrl);
+      }
+    }
+    return chapters;
   }
 
   private findPostId($: CheerioAPI): string {
@@ -472,10 +958,8 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
   async parseNovel(novelPath: string): Promise<Plugin.SourceNovel> {
     const cleanPath = normalizePath(novelPath);
     const novelUrl = `${SITE}${cleanPath}/`;
-    const [page, chapterHtml] = await Promise.all([
-      this.getHtml(novelUrl),
-      this.getChapterHtml(`${novelUrl}ajax/chapters/`, novelUrl),
-    ]);
+    const page = await this.getHtml(novelUrl);
+    const chapterHtml = "";
 
     const { $ } = page;
     $(".manga-title-badges, #manga-title span").remove();
@@ -493,7 +977,10 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
 
     // 1) endpoint baru, 2) admin-ajax lama, 3) daftar chapter di HTML halaman
     const novelId = this.findPostId($);
-    let chapters = chapterHtml ? this.parseChapters(chapterHtml, cleanPath) : [];
+    let chapters = await this.chaptersViaApi(page.html, cleanPath, novelUrl);
+    if (!chapters.length) {
+      chapters = chapterHtml ? this.parseChapters(chapterHtml, cleanPath) : [];
+    }
     if (!chapters.length && novelId) {
       const oldHtml = await this.postForm(
         `${SITE}wp-admin/admin-ajax.php`,
@@ -516,6 +1003,18 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
         fromGet.length > chapters.length ? fromGet : chapters,
       );
       if (discovered.length > chapters.length) chapters = discovered;
+    }
+
+    if (chapters.length < 5) {
+      const firstPath = chapters[0]?.path;
+      const firstHtml = firstPath ? await this.getText(`${SITE}${firstPath}/`) : "";
+      const viaApi = await this.chaptersFromEndpoints(
+        [page.html, firstHtml],
+        cleanPath,
+        novelUrl,
+        chapters,
+      );
+      if (viaApi.length > chapters.length) chapters = viaApi;
     }
 
     const detail = (pattern: RegExp) =>
@@ -623,7 +1122,7 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
       .join("");
   }
 
-  private async describeDynamic(rawHtml: string): Promise<string> {
+  private async describeDynamic(rawHtml: string, log: string[]): Promise<string> {
     const $ = parseHTML(rawHtml);
     const parts: string[] = [];
     const attrs = (el: Cheerio<AnyNode>) =>
@@ -646,6 +1145,28 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
       }
     }
     parts.push(`body[${attrs($("body")).slice(0, 120)}]`);
+    parts.push(
+      `eps=${this.endpointCandidates(rawHtml)
+        .map((url) => url.replace(SITE, "/"))
+        .slice(0, 12)
+        .join(",")}`,
+    );
+    parts.push(`probe=${log.join(" ; ")}`);
+    parts.push(
+      `forms=${$("form")
+        .map((_, el) => `${$(el).attr("method") || "get"}:${$(el).attr("action") || ""}`)
+        .get()
+        .slice(0, 5)
+        .join(",")}`,
+    );
+    parts.push(
+      `xdata=${$("[x-data]")
+        .map((_, el) => ($(el).attr("x-data") || "").replace(/\s+/g, " ").slice(0, 110))
+        .get()
+        .filter(Boolean)
+        .slice(0, 3)
+        .join(" || ")}`,
+    );
 
     const metas = $("meta[name], meta[property]")
       .map((_, el) => $(el).attr("name") || $(el).attr("property") || "")
@@ -690,7 +1211,7 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
     parts.push(`api=${grep(/["'`](\/?api\/[A-Za-z0-9_\-\/.{}$]+)/g, 5, 1)}`);
     parts.push(`action=${grep(/action\s*[:=]\s*["']([A-Za-z0-9_\-]+)["']/g, 6, 1)}`);
     parts.push(`fetch=${grep(/fetch\(([^)]{0,90})\)?/g, 4, 1)}`);
-    return parts.join(" | ").slice(0, 1500);
+    return parts.join(" | ").slice(0, 2400);
   }
 
   async parseChapter(chapterPath: string): Promise<string> {
@@ -717,6 +1238,17 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
       const text = content.text().replace(/\s+/g, " ").trim();
       return text.length >= min && !PLACEHOLDER_RE.test(text);
     };
+
+    // 0) isi sudah ada di HTML (tanpa token) atau diambil lewat API situs
+    for (const selector of ['[x-ref="body"]', ".reader-body"]) {
+      const body = $(selector).first();
+      if (usable(body, 200)) {
+        const html = finish(body);
+        if (html) return html;
+      }
+    }
+    const api = await this.contentViaApi(rawHtml, `${SITE}${cleanPath}/`);
+    if (api.html) return api.html;
 
     // 1) selector yang umum dipakai tema novel
     for (const selector of [
@@ -749,7 +1281,16 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
     const embedded = this.extractEmbedded(rawHtml);
     if (embedded) return embedded;
 
-    const dynamic = await this.describeDynamic(rawHtml);
+    const viaApi = await this.contentFromEndpoints(
+      rawHtml,
+      `${SITE}${cleanPath}/`,
+    );
+    if (viaApi.html) return viaApi.html;
+
+    const dynamic = await this.describeDynamic(rawHtml, [
+      `api=${api.log}`,
+      ...viaApi.log,
+    ]);
     throw new Error(
       `MeioNovel chapter content is loaded by JS: ${cleanPath} | DYN: ${dynamic}`,
     );
