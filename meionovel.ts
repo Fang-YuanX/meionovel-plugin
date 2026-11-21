@@ -10,244 +10,646 @@ const REQUEST_HEADERS = {
   "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8",
 };
 
-const normalizePath = (value: string) => {
-  try {
-    if (/^https?:\/\//i.test(value)) value = new URL(value).pathname;
-  } catch {
-    return "";
-  }
-  return value.split(/[?#]/, 1)[0].replace(/^\/+|\/+$/g, "");
-};
-const novelPathOf = (href: string) => {
+const normalizePath = (path: string) =>
+  path
+    .replace(/^https?:\/\/[^/]+/i, "")
+    .split(/[?#]/, 1)[0]
+    .replace(/^\/+|\/+$/g, "");
+
+const getNovelPath = (href: string) => {
   const path = normalizePath(href);
-  return /^novel\/[^/]+$/i.test(path) ? `${path}/` : undefined;
+  const match = path.match(/^novel\/([^/]+)$/i);
+  return match ? `novel/${match[1]}/` : undefined;
 };
-const chapterPathOf = (href: string) => {
+
+const getChapterPath = (href: string) => {
   const path = normalizePath(href);
-  return /^novel\/[^/]+\/.+/i.test(path) ? path : undefined;
+  return path.startsWith("novel/") ? path : undefined;
 };
-const absoluteUrl = (value: string) => {
-  try {
-    return new URL(value, SITE).href;
-  } catch {
-    return undefined;
-  }
+
+const isUsableUrl = (url?: string): url is string =>
+  !!url && url.trim() !== "" && !/^data:/i.test(url.trim());
+
+const absoluteUrl = (url: string) => {
+  const value = url.trim();
+  if (/^https?:\/\//i.test(value)) return value;
+  if (value.startsWith("//")) return `https:${value}`;
+  if (value.startsWith("/")) return `${SITE}${value.slice(1)}`;
+  return `${SITE}${value}`;
 };
-const usableImage = (value?: string) =>
-  !!value?.trim() && !/^data:|dflazy/i.test(value.trim());
+
+const firstFromSrcset = (srcset?: string) =>
+  srcset?.split(",")[0]?.trim().split(/\s+/)[0];
+
+const getCover = (element: Cheerio<AnyNode>) => {
+  const image = element.find("img").first();
+  const found = [
+    image.attr("data-lazy-src"),
+    image.attr("data-src"),
+    image.attr("data-cfsrc"),
+    firstFromSrcset(image.attr("data-lazy-srcset")),
+    firstFromSrcset(image.attr("data-srcset")),
+    firstFromSrcset(image.attr("srcset")),
+    image.attr("src"),
+  ].find(isUsableUrl);
+  return found ? absoluteUrl(found) : undefined;
+};
+
+const CARD_SELECTOR =
+  ".page-item-detail, .c-tabs-item__content, .novel-item, article";
+
 const NAV_CHAPTER_RE =
   /^[►▶▸\s]*(mulai baca|baca terbaru|start reading|read first|read last|first chapter|latest chapter)/i;
 
-class MeioNovelPlugin implements Plugin.PluginBase {
+const chapterNumberOf = (rest: string): number | undefined => {
+  const last = rest.split("/").pop() || "";
+  const match = last.match(/(\d+(?:\.\d+)?)(?!.*\d)/);
+  return match ? Number(match[1]) : undefined;
+};
+
+const prettyChapterName = (rest: string) =>
+  rest
+    .split("/")
+    .filter(Boolean)
+    .map((segment) =>
+      segment
+        .replace(/[-_]+/g, " ")
+        .replace(/\b\w/g, (char) => char.toUpperCase()),
+    )
+    .join(" ")
+    .replace(/\bMtl\b/g, "MTL");
+
+const labelOf = ($: CheerioAPI, element: AnyNode) => {
+  const el = $(element);
+  const tag = String(el.prop("tagName") || "?").toLowerCase();
+  const cls = (el.attr("class") || "").trim().split(/\s+/)[0];
+  const id = el.attr("id");
+  return `${tag}${cls ? "." + cls : ""}${id ? "#" + id : ""}`;
+};
+
+class MeioNovelCustomPlugin implements Plugin.PluginBase {
   id = "meionovel";
   name = "MeioNovel Custom";
   icon = "src/id/meionovel/icon.png";
   site = SITE;
-  version = "3.0.8";
-  imageRequestInit: Plugin.ImageRequestInit = { headers: { Referer: SITE } };
+  version = "3.0.7";
+  imageRequestInit: Plugin.ImageRequestInit = {
+    headers: { Referer: SITE },
+  };
 
-  private async fetchText(url: string, init?: Parameters<typeof fetchApi>[1]) {
+  private async getHtml(
+    url: string,
+    init?: Parameters<typeof fetchApi>[1],
+  ): Promise<{ html: string; $: CheerioAPI }> {
     const response = await fetchApi(url, {
       ...init,
       headers: { ...REQUEST_HEADERS, ...init?.headers },
     });
-    if (!response.ok) return "";
-    return response.text();
-  }
-
-  private async getHtml(url: string) {
-    const response = await fetchApi(url, { headers: REQUEST_HEADERS });
     if (!response.ok) {
       throw new Error(`MeioNovel request failed (${response.status}): ${url}`);
     }
+
     const html = await response.text();
     const title = html.match(/<title[^>]*>([^<]*)<\/title>/i)?.[1] || "";
-    if (/bot verification|captcha|verify you are human|just a moment/i.test(title)) {
-      throw new Error("MeioNovel blocked the request; open the source in WebView first.");
+    if (
+      /just a moment|bot verification|captcha|verify you are human/i.test(title)
+    ) {
+      throw new Error(
+        "MeioNovel blocked the request; open the source in WebView first.",
+      );
     }
+
     return { html, $: parseHTML(html) };
   }
 
-  private getCover(scope: Cheerio<AnyNode>) {
-    const image = scope.find("img").first();
-    const candidates = [
-      image.attr("data-lazy-src"), image.attr("data-src"), image.attr("data-cfsrc"),
-      image.attr("data-lazy-srcset")?.split(/[ ,]/)[0], image.attr("data-srcset")?.split(/[ ,]/)[0],
-      image.attr("srcset")?.split(/[ ,]/)[0], image.attr("src"),
-    ];
-    const value = candidates.find(usableImage);
-    return value ? absoluteUrl(value) : undefined;
+  private parseNovels($: CheerioAPI): Plugin.NovelItem[] {
+    const novels = new Map<string, Plugin.NovelItem>();
+
+    const findScope = (link: Cheerio<AnyNode>): Cheerio<AnyNode> => {
+      const card = link.closest(CARD_SELECTOR);
+      if (card.length) return card;
+      let node = link;
+      for (let i = 0; i < 2; i++) {
+        node = node.parent();
+        if (!node.length) break;
+        const paths = new Set<string>();
+        node.find("a[href]").each((_, a) => {
+          const p = getNovelPath($(a).attr("href") || "");
+          if (p) paths.add(p);
+        });
+        if (paths.size === 1 && node.find("img").length) return node;
+      }
+      return link;
+    };
+
+    const resultSelector = [
+      ".c-tabs-item__content",
+      ".page-item-detail",
+      ".novel-item",
+    ].find((selector) => $(selector).length > 0);
+    const anchors = resultSelector
+      ? $(resultSelector).find("a[href]")
+      : $("a[href]");
+
+    anchors.each((_, element) => {
+      const link = $(element);
+      const path = getNovelPath(link.attr("href") || "");
+      if (!path) return;
+
+      const scope = findScope(link);
+      const inCard = scope.is(CARD_SELECTOR);
+      const name =
+        (inCard
+          ? scope.find(".post-title, h3, h2").first().text().trim()
+          : "") ||
+        link.attr("title")?.trim() ||
+        link.text().trim() ||
+        scope.find("img").first().attr("alt")?.trim() ||
+        "";
+      const cover = getCover(scope);
+
+      const existing = novels.get(path);
+      if (existing) {
+        if (!existing.cover && cover) existing.cover = cover;
+        if (!existing.name && name) existing.name = name;
+        return;
+      }
+      if (!name) return;
+      novels.set(path, { name, path, cover });
+    });
+
+    return Array.from(novels.values());
   }
 
-  private parseNovels($: CheerioAPI): Plugin.NovelItem[] {
-    const results = new Map<string, Plugin.NovelItem>();
-    const cards = $(".c-tabs-item__content, .page-item-detail, .novel-item");
-    const links = (cards.length ? cards : $("body")).find("a[href]");
-    links.each((_, element) => {
-      const link = $(element);
-      const path = novelPathOf(link.attr("href") || "");
-      if (!path) return;
-      const card = link.closest(".page-item-detail, .c-tabs-item__content, .novel-item, article");
-      const name = card.find(".post-title, h3, h2").first().text().trim() ||
-        link.attr("title")?.trim() || link.text().trim() ||
-        card.find("img").first().attr("alt")?.trim() || "";
-      if (!name) return;
-      const item = results.get(path);
-      if (item) {
-        if (!item.cover) item.cover = this.getCover(card);
-      } else {
-        results.set(path, { name, path, cover: this.getCover(card) });
-      }
+  private seenPaths = new Map<string, Set<string>>();
+
+  private dedupe(
+    key: string,
+    pageNo: number,
+    novels: Plugin.NovelItem[],
+  ): Plugin.NovelItem[] {
+    if (pageNo <= 1 || !this.seenPaths.has(key)) {
+      this.seenPaths.set(key, new Set());
+    }
+    const seen = this.seenPaths.get(key) as Set<string>;
+    return novels.filter((novel) => {
+      if (seen.has(novel.path)) return false;
+      seen.add(novel.path);
+      return true;
     });
-    return [...results.values()];
   }
 
   private parseChapters(html: string, novelPath: string): Plugin.ChapterItem[] {
     const $ = parseHTML(html);
-    const prefix = `${normalizePath(novelPath)}/`;
     const chapters: Plugin.ChapterItem[] = [];
     const seen = new Set<string>();
-    const add = (link: Cheerio<AnyNode>, releaseTime = "") => {
-      const path = chapterPathOf(link.attr("href") || "");
+
+    const push = (link: Cheerio<AnyNode>, releaseTime?: string) => {
+      const path = getChapterPath(link.attr("href") || "");
       const name = link.text().replace(/\s+/g, " ").trim();
-      if (!path || !path.startsWith(prefix) || !name || NAV_CHAPTER_RE.test(name) || seen.has(path)) return;
-      if (/\/(?:ajax|feed|comments?|embed|amp|page)(?:\/|$)/i.test(path.slice(prefix.length))) return;
+      if (!path || !name || seen.has(path)) return;
+      if (NAV_CHAPTER_RE.test(name)) return;
       seen.add(path);
       chapters.push({ name, path, releaseTime: releaseTime || undefined });
     };
+
     $(".wp-manga-chapter, .chapter-item").each((_, element) => {
-      const row = $(element);
-      add(row.find("a[href]").first(), row.find(".chapter-release-date").text().trim());
+      const chapter = $(element);
+      push(
+        chapter.find("a").first(),
+        chapter.find(".chapter-release-date").text().trim(),
+      );
     });
-    if (!chapters.length) $("a[href]").each((_, element) => add($(element)));
-    return chapters.reverse().map((chapter, index) => ({ ...chapter, chapterNumber: index + 1 }));
+
+    if (!chapters.length) {
+      const prefix = `${novelPath}/`;
+      $("a[href]").each((_, element) => {
+        const link = $(element);
+        const path = getChapterPath(link.attr("href") || "");
+        if (!path || !path.startsWith(prefix)) return;
+        push(link);
+      });
+    }
+
+    return chapters.reverse().map((chapter, index) => ({
+      ...chapter,
+      chapterNumber: index + 1,
+    }));
   }
 
-  private async chapterListHtml(endpoint: string, novelUrl: string) {
-    const request = async (method: "POST" | "GET", url = endpoint) => {
-      try {
-        const response = await fetchApi(url, {
-          method,
-          headers: { ...REQUEST_HEADERS, Referer: novelUrl, ...(method === "POST" ? { "X-Requested-With": "XMLHttpRequest" } : {}) },
-          ...(method === "POST" ? { referrer: novelUrl } : {}),
-        });
-        return response.ok ? await response.text() : "";
-      } catch {
-        return "";
-      }
-    };
-    let html = await request("POST");
-    if (!html || html.trim() === "0") html = await request("GET");
-    if (!html || html.trim() === "0") return "";
+  private async postForm(
+    url: string,
+    body: string,
+    referer: string,
+  ): Promise<string> {
+    try {
+      const response = await fetchApi(url, {
+        method: "POST",
+        headers: {
+          ...REQUEST_HEADERS,
+          "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+          "X-Requested-With": "XMLHttpRequest",
+          Referer: referer,
+        },
+        body,
+      });
+      return response.ok ? await response.text() : "";
+    } catch (error) {
+      return "";
+    }
+  }
+
+  private async getChapterHtml(
+    endpoint: string,
+    novelUrl: string,
+  ): Promise<string> {
+    const fetchPage = async (url: string) =>
+      fetchApi(url, {
+        method: "POST",
+        headers: REQUEST_HEADERS,
+        referrer: novelUrl,
+      })
+        .then((response) => (response.ok ? response.text() : ""))
+        .catch(() => "");
+
+    let html = await fetchPage(endpoint);
+    if (!html || html === "0") return "";
 
     const $ = parseHTML(html);
     const pageLinks = $(".pagination a[data-page]");
-    const pageNumbers = pageLinks.map((_, el) => Number.parseInt($(el).attr("data-page") || "", 10))
-      .get().filter((n) => Number.isFinite(n) && n > 1);
-    const maxPage = Math.min(100, Math.max(1, ...pageNumbers));
+    const pageNumbers = pageLinks
+      .map((_, element) =>
+        Number.parseInt($(element).attr("data-page") || "", 10),
+      )
+      .get()
+      .filter((page) => Number.isFinite(page) && page > 1);
+    const maxPage = Math.max(1, ...pageNumbers);
     const lastHref = pageLinks.last().attr("href") || "";
-    const queryAt = lastHref.indexOf("?");
-    if (maxPage <= 1 || queryAt < 0) return html;
-    const template = lastHref.slice(queryAt).replace(/\d+$/, "");
-    const urls = Array.from({ length: maxPage - 1 }, (_, i) => `${endpoint}${template}${i + 2}`);
-    for (let i = 0; i < urls.length; i += 6) {
-      const pages = await Promise.all(urls.slice(i, i + 6).map((url) => request("POST", url)));
-      html += pages.filter((page) => page && page.trim() !== "0").join("");
+    const queryIndex = lastHref.indexOf("?");
+    if (maxPage === 1 || queryIndex === -1) return html;
+
+    const queryTemplate = lastHref.slice(queryIndex).replace(/\d+$/, "");
+    const pageUrls = Array.from(
+      { length: maxPage - 1 },
+      (_, index) => `${endpoint}${queryTemplate}${index + 2}`,
+    );
+    for (let index = 0; index < pageUrls.length; index += 6) {
+      const batch = pageUrls.slice(index, index + 6);
+      const pages = await Promise.all(batch.map(fetchPage));
+      html += pages.filter((page) => page && page !== "0").join("");
     }
+
     return html;
   }
 
-  async popularNovels(pageNo: number, options: Plugin.PopularNovelsOptions<typeof this.filters>): Promise<Plugin.NovelItem[]> {
+  async popularNovels(
+    pageNo: number,
+    options: Plugin.PopularNovelsOptions<typeof this.filters>,
+  ): Promise<Plugin.NovelItem[]> {
     const order = options?.showLatestNovels ? "latest" : "views";
-    const html = await this.fetchText(`${SITE}novel/page/${pageNo}/?m_orderby=${order}`);
-    return html ? this.parseNovels(parseHTML(html)) : [];
+    try {
+      const { $ } = await this.getHtml(
+        `${SITE}novel/page/${pageNo}/?m_orderby=${order}`,
+      );
+      return this.dedupe(`popular:${order}`, pageNo, this.parseNovels($));
+    } catch (error) {
+      if (pageNo > 1 && /\(404\)/.test(String((error as Error)?.message))) {
+        return [];
+      }
+      throw error;
+    }
   }
 
-  async searchNovels(searchTerm: string, pageNo: number): Promise<Plugin.NovelItem[]> {
-    const html = await this.fetchText(`${SITE}page/${pageNo}/?s=${encodeURIComponent(searchTerm)}&post_type=wp-manga`);
-    return html ? this.parseNovels(parseHTML(html)) : [];
+  async searchNovels(
+    searchTerm: string,
+    pageNo: number,
+  ): Promise<Plugin.NovelItem[]> {
+    const query = encodeURIComponent(searchTerm);
+    try {
+      const { $ } = await this.getHtml(
+        `${SITE}page/${pageNo}/?s=${query}&post_type=wp-manga`,
+      );
+      return this.dedupe(`search:${query}`, pageNo, this.parseNovels($));
+    } catch (error) {
+      if (pageNo > 1 && /\(404\)/.test(String((error as Error)?.message))) {
+        return [];
+      }
+      throw error;
+    }
   }
 
-  private findPostId($: CheerioAPI) {
+  private discoverChapters(
+    html: string,
+    cleanPath: string,
+    known: Plugin.ChapterItem[],
+  ): Plugin.ChapterItem[] {
+    const slug = cleanPath.replace(/^novel\//, "").replace(/\/+$/, "");
+    const base = `novel/${slug}/`;
+    const names = new Map<string, string>();
+    const order: string[] = [];
+    const add = (path: string, name?: string) => {
+      const clean = path.replace(/\/+$/, "");
+      const rest = clean.slice(base.length);
+      if (!clean.startsWith(base) || !rest) return;
+      if (/^(ajax|feed|comments?|embed|amp|page)(\/|$)/i.test(rest)) return;
+      if (name && NAV_CHAPTER_RE.test(name)) name = undefined;
+      if (!names.has(clean)) {
+        names.set(clean, name || prettyChapterName(rest));
+        order.push(clean);
+      } else if (name && /^(MTL )?Chapter/i.test(names.get(clean) || "")) {
+        names.set(clean, name);
+      }
+    };
+
+    known.forEach((chapter) => add(chapter.path, chapter.name));
+
+    const $ = parseHTML(html);
+    $("a[href]").each((_, element) => {
+      const link = $(element);
+      const path = getChapterPath(link.attr("href") || "");
+      if (path) add(path, link.text().replace(/\s+/g, " ").trim());
+    });
+
+    const escaped = slug.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp(
+      "novel(?:\\\\?/)" +
+        escaped +
+        "((?:(?:\\\\?/)[A-Za-z0-9_\\-]+)+)",
+      "g",
+    );
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(html))) {
+      add(`${base}${match[1].replace(/\\?\//g, "/").replace(/^\/+/, "")}`);
+    }
+
+    const items = order.map((path) => ({
+      path,
+      name: names.get(path) as string,
+      num: chapterNumberOf(path.slice(base.length)),
+    }));
+    const numbered = items.filter((item) => item.num !== undefined).length;
+    if (items.length && numbered / items.length >= 0.8) {
+      items.sort(
+        (a, b) =>
+          (a.num as number) - (b.num as number) ||
+          a.path.localeCompare(b.path),
+      );
+    }
+    return items.map((item, index) => ({
+      name: item.name,
+      path: item.path,
+      chapterNumber: index + 1,
+    }));
+  }
+
+  private async getText(url: string): Promise<string> {
+    try {
+      const response = await fetchApi(url, { headers: REQUEST_HEADERS });
+      return response.ok ? await response.text() : "";
+    } catch (error) {
+      return "";
+    }
+  }
+
+  private findPostId($: CheerioAPI): string {
     const bodyClass = $("body").attr("class") || "";
-    return $(".rating-post-id").attr("value") || $("#manga-chapters-holder").attr("data-id") ||
-      $("[data-post]").first().attr("data-post") || bodyClass.match(/(?:^|\s)postid-(\d+)/)?.[1] ||
-      ($('link[rel="shortlink"]').attr("href") || "").match(/[?&]p=(\d+)/)?.[1] || "";
+    return (
+      $(".rating-post-id").attr("value") ||
+      $("#manga-chapters-holder").attr("data-id") ||
+      $("[data-post]").first().attr("data-post") ||
+      bodyClass.match(/(?:^|\s)postid-(\d+)/)?.[1] ||
+      ($('link[rel="shortlink"]').attr("href") || "").match(/[?&]p=(\d+)/)?.[1] ||
+      ($("article[id^='post-']").first().attr("id") || "").replace("post-", "") ||
+      ""
+    );
+  }
+
+  private async probe(url: string, body: string, referer: string) {
+    try {
+      const response = await fetchApi(url, {
+        method: "POST",
+        headers: {
+          ...REQUEST_HEADERS,
+          "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+          "X-Requested-With": "XMLHttpRequest",
+          Referer: referer,
+        },
+        body,
+      });
+      const text = await response.text();
+      return `${response.status}/${text.length}/${text
+        .replace(/\s+/g, " ")
+        .slice(0, 140)}`;
+    } catch (error) {
+      return `ERR ${String(error).slice(0, 80)}`;
+    }
   }
 
   async parseNovel(novelPath: string): Promise<Plugin.SourceNovel> {
     const cleanPath = normalizePath(novelPath);
     const novelUrl = `${SITE}${cleanPath}/`;
-    const [{ html: pageHtml, $ }, chapterHtml] = await Promise.all([
-      this.getHtml(novelUrl), this.chapterListHtml(`${novelUrl}ajax/chapters/`, novelUrl),
+    const [page, chapterHtml] = await Promise.all([
+      this.getHtml(novelUrl),
+      this.getChapterHtml(`${novelUrl}ajax/chapters/`, novelUrl),
     ]);
-    $(".manga-title-badges, #manga-title span").remove();
-    const name = $(".post-title h1").first().text().trim() || $("#manga-title h1").first().text().trim() ||
-      $(".manga-title").first().text().trim() || $("h1.entry-title").first().text().trim() ||
-      $("h1").first().text().trim() || $('meta[property="og:title"]').attr("content")?.trim() || "";
-    if (!name) throw new Error(`MeioNovel novel page had no title: ${novelUrl}`);
 
-    let chapters = chapterHtml ? this.parseChapters(chapterHtml, cleanPath) : [];
-    // Some installations reject POST with 405 but serve the list on GET; retry GET before legacy AJAX.
-    if (chapters.length <= 1) {
-      const getHtml = await this.fetchText(`${novelUrl}ajax/chapters/`);
-      const getChapters = getHtml ? this.parseChapters(getHtml, cleanPath) : [];
-      if (getChapters.length > chapters.length) chapters = getChapters;
+    const { $ } = page;
+    $(".manga-title-badges, #manga-title span").remove();
+
+    const name =
+      $(".post-title h1").first().text().trim() ||
+      $("#manga-title h1").first().text().trim() ||
+      $(".manga-title").first().text().trim() ||
+      $("h1.entry-title").first().text().trim() ||
+      $("h1").first().text().trim() ||
+      ($('meta[property="og:title"]').attr("content") || "").trim();
+    if (!name) {
+      throw new Error(`MeioNovel novel page had no title: ${novelUrl}`);
     }
-    if (!chapters.length) {
-      const postId = this.findPostId($);
-      if (postId) {
-        const form = `action=manga_get_chapters&manga=${encodeURIComponent(postId)}`;
-        const oldHtml = await this.fetchText(`${SITE}wp-admin/admin-ajax.php`, {
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8", "X-Requested-With": "XMLHttpRequest", Referer: novelUrl },
-          body: form,
-        });
-        if (oldHtml && oldHtml.trim() !== "0") chapters = this.parseChapters(oldHtml, cleanPath);
+
+    // 1) endpoint baru, 2) admin-ajax lama, 3) daftar chapter di HTML halaman
+    const novelId = this.findPostId($);
+    let chapters = chapterHtml ? this.parseChapters(chapterHtml, cleanPath) : [];
+    if (!chapters.length && novelId) {
+      const oldHtml = await this.postForm(
+        `${SITE}wp-admin/admin-ajax.php`,
+        `action=manga_get_chapters&manga=${encodeURIComponent(novelId)}`,
+        novelUrl,
+      );
+      if (oldHtml && oldHtml !== "0") {
+        chapters = this.parseChapters(oldHtml, cleanPath);
       }
     }
-    if (!chapters.length) chapters = this.parseChapters(pageHtml, cleanPath);
+    if (!chapters.length) {
+      chapters = this.parseChapters(page.html, cleanPath);
+    }
+    if (chapters.length <= 1) {
+      const getAjax = await this.getText(`${novelUrl}ajax/chapters/`);
+      const fromGet = getAjax ? this.parseChapters(getAjax, cleanPath) : [];
+      const discovered = this.discoverChapters(
+        `${page.html}\n${getAjax}`,
+        cleanPath,
+        fromGet.length > chapters.length ? fromGet : chapters,
+      );
+      if (discovered.length > chapters.length) chapters = discovered;
+    }
 
-    const detail = (pattern: RegExp) => $(".post-content_item").filter((_, el) => pattern.test($(el).find("h5").text()));
-    const coverUrl = this.getCover($(".summary_image").first()) || $('meta[property="og:image"]').attr("content");
-    const summary = $(".summary__content, .manga-summary, .description-summary").first().text().trim() ||
-      $('meta[property="og:description"]').attr("content")?.trim() || $('meta[name="description"]').attr("content")?.trim();
+    const detail = (pattern: RegExp) =>
+      $(".post-content_item")
+        .filter((_, element) => pattern.test($(element).find("h5").text()))
+        .find(".summary-content, .summary_content");
+
     const statusText = detail(/status/i).text().trim();
+
+    const cover =
+      getCover($(".summary_image").first()) ||
+      ($('meta[property="og:image"]').attr("content") &&
+      isUsableUrl($('meta[property="og:image"]').attr("content"))
+        ? absoluteUrl($('meta[property="og:image"]').attr("content") as string)
+        : undefined);
+
+    let summary =
+      $(".summary__content, .manga-summary, .description-summary")
+        .first()
+        .text()
+        .trim() ||
+      ($('meta[property="og:description"]').attr("content") || "").trim() ||
+      ($('meta[name="description"]').attr("content") || "").trim() ||
+      undefined;
+
+    if (chapters.length <= 1) {
+      const newProbe = await this.probe(
+        `${novelUrl}ajax/chapters/`,
+        "",
+        novelUrl,
+      );
+      const under = $("a[href]")
+        .map((_, el) => normalizePath($(el).attr("href") || ""))
+        .get()
+        .filter((p) => p.startsWith(`${cleanPath}/`))
+        .slice(0, 4)
+        .join(",");
+      const ids = $("[id]")
+        .map((_, el) => $(el).attr("id") || "")
+        .get()
+        .slice(0, 12)
+        .join(",");
+      const lists = $("div, ul, ol, section, nav")
+        .map((_, el) => ({ label: labelOf($, el), n: $(el).find("a").length }))
+        .get()
+        .sort((x, y) => y.n - x.n)
+        .slice(2, 8)
+        .map((x) => `${x.label}:${x.n}`)
+        .join(",");
+      const scriptText =
+        $("script")
+          .map((_, el) => $(el).html() || "")
+          .get()
+          .find((t) => /chapter/i.test(t)) || "";
+      const at = scriptText.search(/chapter/i);
+      const scriptCtx = scriptText
+        ? scriptText.slice(Math.max(0, at - 60), at + 140).replace(/\s+/g, " ")
+        : "";
+      summary = `${summary || ""}\n\n[DIAG 3.0.7] id=${novelId} got=${chapters.length} under=${under} ids=${ids} lists=${lists} new=${newProbe} scr=${scriptCtx}`;
+    }
+
     return {
-      path: novelPath, name,
-      cover: coverUrl && usableImage(coverUrl) ? absoluteUrl(coverUrl) : undefined,
-      author: detail(/author/i).find(".summary-content, .summary_content").text().trim() || undefined,
-      genres: detail(/genre|kategori|tag/i).find("a").map((_, el) => $(el).text().trim()).get().filter(Boolean).join(", ") || undefined,
-      status: /ongoing|on-going|berjalan/i.test(statusText) ? NovelStatus.Ongoing :
-        /completed|complete|end|tamat|selesai/i.test(statusText) ? NovelStatus.Completed : NovelStatus.Unknown,
-      summary, chapters,
+      path: novelPath,
+      name,
+      cover,
+      author: detail(/author/i).text().trim() || undefined,
+      genres:
+        detail(/genre|kategori|tag/i)
+          .find("a")
+          .map((_, element) => $(element).text().trim())
+          .get()
+          .filter(Boolean)
+          .join(", ") || undefined,
+      status: /ongoing|on-going|berjalan/i.test(statusText)
+        ? NovelStatus.Ongoing
+        : /completed|complete|end|tamat|selesai/i.test(statusText)
+          ? NovelStatus.Completed
+          : NovelStatus.Unknown,
+      summary,
+      chapters,
     };
   }
 
   async parseChapter(chapterPath: string): Promise<string> {
     const cleanPath = normalizePath(chapterPath);
     const { $, html: rawHtml } = await this.getHtml(`${SITE}${cleanPath}/`);
-    $("script, style, noscript, iframe, .ads, .ad, .adsbygoogle, .chapter-nav, .nav-links, .wp-manga-nav, nav, header, footer, form, .comments, #comments").remove();
-    const selectors = [".reading-content", "#chapter-content", ".chapter-content", ".chapter-body", "#chr-content", ".text-left", ".text-right", ".entry-content", ".c-blog-post > div > div:nth-child(2)"];
-    for (const selector of selectors) {
-      const content = $(selector).first();
-      const text = content.text().replace(/\s+/g, " ").trim();
-      if (!content.length || text.length < 30) continue;
-      content.find("p").each((_, p) => {
-        const paragraph = $(p);
+    $(
+      "script, style, noscript, iframe, .ads, .ad, .adsbygoogle, .chapter-nav, .nav-links, .wp-manga-nav, nav, header, footer, form, .comments, #comments",
+    ).remove();
+
+    const finish = (content: Cheerio<AnyNode>) => {
+      content.find("p").each((_, element) => {
+        const paragraph = $(element);
         if (!paragraph.find("br").length) return;
-        const lines = (paragraph.html() || "").split(/<br\s*\/?>/i)
+        const lines = (paragraph.html() || "")
+          .split(/<br\s*\/?>/i)
           .map((line) => line.replace(/\uFEFF/g, "").trim())
           .filter((line) => line.replace(/&nbsp;|\u00a0/g, "").trim());
         paragraph.replaceWith(lines.map((line) => `<p>${line}</p>`).join(""));
       });
-      return content.html()?.trim() || "";
+      return content.html()?.trim();
+    };
+
+    // 1) selector yang umum dipakai tema novel
+    for (const selector of [
+      ".reading-content",
+      "#chapter-content",
+      ".chapter-content",
+      ".chapter-body",
+      "#chr-content",
+      ".entry-content",
+      ".text-left",
+      ".text-right",
+      "article",
+    ]) {
+      const content = $(selector).first();
+      if (content.text().replace(/\s+/g, " ").trim().length < 200) continue;
+      const html = finish(content);
+      if (html) return html;
     }
-    const title = rawHtml.match(/<title[^>]*>([^<]*)<\/title>/i)?.[1]?.replace(/\s+/g, " ").trim().slice(0, 80) || "";
-    throw new Error(`MeioNovel chapter content not found: ${cleanPath} | title=${title}`);
+
+    // 2) deteksi otomatis: container dengan teks paragraf terbanyak
+    const candidates: { el: Cheerio<AnyNode>; score: number; label: string }[] =
+      [];
+    $("article, main, section, div, td").each((_, element) => {
+      const el = $(element);
+      let score = 0;
+      el.children("p").each((__, p) => {
+        score += $(p).text().trim().length;
+      });
+      if (el.children("br").length > 3) {
+        score += el.clone().children().remove().end().text().trim().length;
+      }
+      if (score > 0) {
+        candidates.push({ el, score, label: `${labelOf($, element)}:${score}` });
+      }
+    });
+    candidates.sort((a, b) => b.score - a.score);
+    if (candidates.length && candidates[0].score >= 150) {
+      const html = finish(candidates[0].el);
+      if (html) return html;
+    }
+
+    const title = (rawHtml.match(/<title[^>]*>([^<]*)<\/title>/i)?.[1] || "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 60);
+    const bodyClass = ($("body").attr("class") || "").slice(0, 60);
+    throw new Error(
+      `MeioNovel chapter had no readable content: ${cleanPath} | title=${title} | p=${$("p").length} len=${rawHtml.length} | top=${candidates
+        .slice(0, 4)
+        .map((c) => c.label)
+        .join(",")} | body=${bodyClass}`,
+    );
   }
 
-  resolveUrl = (path: string) => /^https?:\/\//i.test(path) ? path : `${SITE}${normalizePath(path)}/`;
+  resolveUrl = (path: string) =>
+    /^https?:\/\//i.test(path) ? path : `${SITE}${normalizePath(path)}/`;
 }
 
-export default new MeioNovelPlugin();
+export default new MeioNovelCustomPlugin();
