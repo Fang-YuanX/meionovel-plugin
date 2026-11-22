@@ -299,12 +299,75 @@ const readConfig = (source: string, keys: string[]): Record<string, string> => {
 const asIdValue = (value: string | undefined): string | number | undefined =>
   value === undefined ? undefined : /^-?\d+$/.test(value) ? Number(value) : value;
 
+const sleep = (ms: number) =>
+  new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+// Hapus judul ganda di awal isi chapter (situs menaruh judul dua kali)
+const dedupeLeading = (html: string): string => {
+  const $ = parseHTML(`<div id="mn-root">${html}</div>`);
+  const children = $("#mn-root").children();
+  const textOf = (i: number) =>
+    children.eq(i).text().replace(/\s+/g, " ").trim();
+  for (let i = 0; i < 3 && i + 1 < children.length; i++) {
+    if (textOf(i) && textOf(i) === textOf(i + 1)) {
+      children.eq(i).remove();
+      break;
+    }
+  }
+  return $("#mn-root").html() || html;
+};
+
+const cleanChapterName = (name: string) =>
+  name
+    .replace(/\s*[●•·▪].*$/, "")
+    .replace(/sedang dibaca/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+// Unescape isi literal string JS ('...'): \u0022 -> ", \\ -> \, \/ -> /
+const jsUnescape = (literal: string) =>
+  literal.replace(/\\(u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|[\s\S])/g, (_, c: string) => {
+    if (c.length === 5 || c.length === 3) {
+      return String.fromCharCode(parseInt(c.slice(1), 16));
+    }
+    const map: Record<string, string> = {
+      n: "\n",
+      t: "\t",
+      r: "\r",
+      b: "\b",
+      f: "\f",
+      v: "\v",
+    };
+    return map[c] !== undefined ? map[c] : c;
+  });
+
+// x-data bisa berupa chapterList(JSON.parse('...')) (escape dua lapis) atau
+// reader({ key: 'nilai', ... }) (objek literal biasa)
+const readXData = (xdata: string, keys: string[]): Record<string, string> => {
+  const match = /^\s*\w+\(\s*JSON\.parse\('((?:[^'\\]|\\[\s\S])*)'\)\s*\)\s*$/.exec(
+    xdata,
+  );
+  if (match) {
+    try {
+      const obj = JSON.parse(jsUnescape(match[1]));
+      const out: Record<string, string> = {};
+      keys.forEach((key) => {
+        if (obj[key] !== undefined && obj[key] !== null) out[key] = String(obj[key]);
+      });
+      return out;
+    } catch (error) {
+      // jatuh ke pembaca objek literal di bawah
+    }
+  }
+  return readConfig(xdata, keys);
+};
+
 class MeioNovelCustomPlugin implements Plugin.PluginBase {
   id = "meionovel";
   name = "MeioNovel Custom";
   icon = "src/id/meionovel/icon.png";
   site = SITE;
-  version = "3.1.0";
+  version = "3.1.2";
   imageRequestInit: Plugin.ImageRequestInit = {
     headers: { Referer: SITE },
   };
@@ -564,6 +627,7 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
       const rest = clean.slice(base.length);
       if (!clean.startsWith(base) || !rest) return;
       if (/^(ajax|feed|comments?|embed|amp|page)(\/|$)/i.test(rest)) return;
+      if (name) name = cleanChapterName(name) || undefined;
       if (name && NAV_CHAPTER_RE.test(name)) name = undefined;
       if (!names.has(clean)) {
         names.set(clean, name || prettyChapterName(rest));
@@ -586,6 +650,7 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
     }
 
     const $ = parseHTML(html);
+    $(".trap-link").remove();
     $("a[href]").each((_, element) => {
       const link = $(element);
       const path = getChapterPath(link.attr("href") || "");
@@ -755,6 +820,23 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
     return { log };
   }
 
+  private async postJsonRetry(
+    url: string,
+    body: unknown,
+    csrf: string,
+    referer: string,
+  ): Promise<{ ok: boolean; status: number; data: any }> {
+    let res = await this.postJson(url, body, csrf, referer);
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      if (res.status !== 429 && res.status !== 0 && res.status < 500) break;
+      await sleep(700 * attempt);
+      res = await this.postJson(url, body, csrf, referer);
+    }
+    return res;
+  }
+
+  private pagingLog = "";
+
   private async postJson(
     url: string,
     body: unknown,
@@ -795,7 +877,7 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
     for (let attempt = 0; attempt < 2; attempt++) {
       const $ = parseHTML(html);
       const xdata = $('[x-data*="reader"]').first().attr("x-data") || "";
-      let cfg = readConfig(xdata, ["contentUrl", "contentToken", "chapterId"]);
+      let cfg = readXData(xdata, ["contentUrl", "contentToken", "chapterId"]);
       if (!cfg.contentUrl || !cfg.contentToken) {
         cfg = readConfig(html, ["contentUrl", "contentToken", "chapterId"]);
       }
@@ -834,6 +916,7 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
     pageHtml: string,
     cleanPath: string,
     novelUrl: string,
+    expectedTotal = 0,
   ): Promise<Plugin.ChapterItem[]> {
     const attempt = async (
       html: string,
@@ -845,7 +928,7 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
       let makeBody: (params: Record<string, string>) => unknown = () => ({});
 
       const listX = $('[x-data*="chapterList"]').first().attr("x-data") || "";
-      let list = readConfig(listX || html, ["url", "novel", "token"]);
+      let list = readXData(listX || html, ["url", "novel", "token"]);
       if (list.url && list.token && list.novel) {
         url = absoluteUrl(list.url);
         makeBody = (params) => ({
@@ -855,7 +938,7 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
         });
       } else {
         const readerX = $('[x-data*="reader"]').first().attr("x-data") || "";
-        list = readConfig(readerX || html, [
+        list = readXData(readerX || html, [
           "listUrl",
           "listToken",
           "novelId",
@@ -870,14 +953,16 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
         });
       }
 
-      const first = await this.postJson(url, makeBody({}), csrf, referer);
+      const first = await this.postJsonRetry(url, makeBody({}), csrf, referer);
       if (first.status === 419) return [];
       if (!first.ok || typeof first.data?.html !== "string") return [];
 
       let found = this.discoverChapters(first.data.html, cleanPath, []);
-      const pageNumbers = (first.data.html.match(/[?&]page=(\d+)/g) || []).map(
-        (m: string) => Number(m.replace(/\D/g, "")),
-      );
+      const pageNumbers = (
+        (first.data.html.match(/(?:[?&]|&amp;)page=(\d+)/g) || []).concat(
+          first.data.html.match(/data-page=["'](\d+)/g) || [],
+        ) as string[]
+      ).map((m: string) => Number(m.replace(/\D/g, "")));
       let maxPage = Math.max.apply(null, [1].concat(pageNumbers));
       ["last_page", "total_pages", "pages", "page_count", "max_page"].forEach(
         (key) => {
@@ -885,21 +970,71 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
           if (value > maxPage) maxPage = value;
         },
       );
+      if (expectedTotal > found.length) {
+        maxPage = Math.max(
+          maxPage,
+          Math.ceil(expectedTotal / Math.max(1, found.length)),
+        );
+      }
+      const log: string[] = [`p1:${found.length} max=${maxPage}`];
 
-      let limit = maxPage > 1 ? maxPage : 2;
-      for (let page = 2; page <= Math.min(limit, 600); page++) {
-        const res = await this.postJson(
+      // A) paginasi lewat params.page
+      let stoppedEarly = false;
+      for (let page = 2; page <= 800; page++) {
+        if (maxPage > 1 && page > maxPage) break;
+        if (expectedTotal && found.length >= expectedTotal) break;
+        await sleep(120);
+        const res = await this.postJsonRetry(
           url,
           makeBody({ page: String(page) }),
           csrf,
           referer,
         );
-        if (!res.ok || typeof res.data?.html !== "string") break;
+        if (!res.ok || typeof res.data?.html !== "string") {
+          log.push(`p${page}:st${res.status}`);
+          stoppedEarly = true;
+          break;
+        }
         const merged = this.discoverChapters(res.data.html, cleanPath, found);
-        if (merged.length <= found.length) break; // tidak ada chapter baru
+        if (merged.length <= found.length) {
+          log.push(`p${page}:nogrow`);
+          stoppedEarly = maxPage <= 1 ? page === 2 : true;
+          break;
+        }
         found = merged;
-        if (maxPage <= 1) limit = page + 1; // jumlah halaman tidak diketahui
       }
+
+      // B) cadangan: lompat ke chapter berikutnya bila params.page tidak jalan
+      if (
+        stoppedEarly &&
+        found.length >= 50 &&
+        (!expectedTotal || found.length < expectedTotal)
+      ) {
+        for (let step = 0; step < 800; step++) {
+          const lastPath = found[found.length - 1].path;
+          const lastNumber =
+            chapterNumberOf(lastPath.slice(`${cleanPath}/`.length)) || found.length;
+          await sleep(120);
+          const res = await this.postJsonRetry(
+            url,
+            makeBody({ lompat: String(lastNumber + 1) }),
+            csrf,
+            referer,
+          );
+          if (!res.ok || typeof res.data?.html !== "string") {
+            log.push(`j${lastNumber + 1}:st${res.status}`);
+            break;
+          }
+          const merged = this.discoverChapters(res.data.html, cleanPath, found);
+          if (merged.length <= found.length) {
+            log.push(`j${lastNumber + 1}:nogrow`);
+            break;
+          }
+          found = merged;
+        }
+      }
+      log.push(`total=${found.length}`);
+      this.pagingLog = log.join(" ");
       return found;
     };
 
@@ -959,78 +1094,51 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
     const cleanPath = normalizePath(novelPath);
     const novelUrl = `${SITE}${cleanPath}/`;
     const page = await this.getHtml(novelUrl);
-    const chapterHtml = "";
-
     const { $ } = page;
-    $(".manga-title-badges, #manga-title span").remove();
+    $(".trap-link").remove(); // tautan jebakan anti-bot: jangan pernah disentuh
 
+    const h1 = $("h1").first();
     const name =
-      $(".post-title h1").first().text().trim() ||
-      $("#manga-title h1").first().text().trim() ||
-      $(".manga-title").first().text().trim() ||
-      $("h1.entry-title").first().text().trim() ||
-      $("h1").first().text().trim() ||
+      h1.text().replace(/\s+/g, " ").trim() ||
       ($('meta[property="og:title"]').attr("content") || "").trim();
     if (!name) {
       throw new Error(`MeioNovel novel page had no title: ${novelUrl}`);
     }
 
-    // 1) endpoint baru, 2) admin-ajax lama, 3) daftar chapter di HTML halaman
-    const novelId = this.findPostId($);
-    let chapters = await this.chaptersViaApi(page.html, cleanPath, novelUrl);
-    if (!chapters.length) {
-      chapters = chapterHtml ? this.parseChapters(chapterHtml, cleanPath) : [];
-    }
-    if (!chapters.length && novelId) {
-      const oldHtml = await this.postForm(
-        `${SITE}wp-admin/admin-ajax.php`,
-        `action=manga_get_chapters&manga=${encodeURIComponent(novelId)}`,
-        novelUrl,
-      );
-      if (oldHtml && oldHtml !== "0") {
-        chapters = this.parseChapters(oldHtml, cleanPath);
+    // jumlah chapter dari statistik halaman: <dd>909</dd><dt>Chapter</dt>
+    let expectedTotal = 0;
+    $("dt").each((_, element) => {
+      if ($(element).text().trim().toLowerCase() === "chapter") {
+        const count = Number(
+          $(element).siblings("dd").first().text().replace(/[^\d]/g, ""),
+        );
+        if (count > 0) expectedTotal = count;
       }
-    }
+    });
+
+    let chapters = await this.chaptersViaApi(
+      page.html,
+      cleanPath,
+      novelUrl,
+      expectedTotal,
+    );
     if (!chapters.length) {
-      chapters = this.parseChapters(page.html, cleanPath);
-    }
-    if (chapters.length <= 1) {
-      const getAjax = await this.getText(`${novelUrl}ajax/chapters/`);
-      const fromGet = getAjax ? this.parseChapters(getAjax, cleanPath) : [];
-      const discovered = this.discoverChapters(
-        `${page.html}\n${getAjax}`,
-        cleanPath,
-        fromGet.length > chapters.length ? fromGet : chapters,
-      );
-      if (discovered.length > chapters.length) chapters = discovered;
+      chapters = this.discoverChapters(page.html, cleanPath, []);
     }
 
-    if (chapters.length < 5) {
-      const firstPath = chapters[0]?.path;
-      const firstHtml = firstPath ? await this.getText(`${SITE}${firstPath}/`) : "";
-      const viaApi = await this.chaptersFromEndpoints(
-        [page.html, firstHtml],
-        cleanPath,
-        novelUrl,
-        chapters,
-      );
-      if (viaApi.length > chapters.length) chapters = viaApi;
-    }
-
-    const detail = (pattern: RegExp) =>
-      $(".post-content_item")
-        .filter((_, element) => pattern.test($(element).find("h5").text()))
-        .find(".summary-content, .summary_content");
-
-    const statusText = detail(/status/i).text().trim();
-
+    // cover
+    const ogImage = $('meta[property="og:image"]').attr("content");
     const cover =
+      getCover($('img[alt^="Cover"]').first().parent()) ||
       getCover($(".summary_image").first()) ||
-      ($('meta[property="og:image"]').attr("content") &&
-      isUsableUrl($('meta[property="og:image"]').attr("content"))
-        ? absoluteUrl($('meta[property="og:image"]').attr("content") as string)
-        : undefined);
+      (isUsableUrl(ogImage) ? absoluteUrl(ogImage) : undefined);
 
+    // sinopsis lengkap (og:description terpotong)
+    const synopsis = $('[class*="68ch"] p')
+      .map((_, p) => $(p).text().replace(/\s+/g, " ").trim())
+      .get()
+      .filter(Boolean)
+      .join("\n\n");
     const metaDescription = (
       $('meta[property="og:description"]').attr("content") ||
       $('meta[name="description"]').attr("content") ||
@@ -1038,187 +1146,63 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
     )
       .replace(/\s+/g, " ")
       .trim();
-    const readText = (el: Cheerio<AnyNode>) => {
-      const paragraphs = el
-        .find("p")
-        .map((_, p) => $(p).text().replace(/\s+/g, " ").trim())
-        .get()
-        .filter(Boolean);
-      return (paragraphs.length ? paragraphs.join("\n\n") : el.text())
-        .replace(/[ \t]+/g, " ")
-        .trim();
+    const finalSummary = synopsis || metaDescription || undefined;
+
+    // genre + tag, penulis, status
+    const names = (selector: string) => {
+      const out: string[] = [];
+      $(selector).each((_, el) => {
+        const value = $(el).text().replace(/\s+/g, " ").trim();
+        if (value && value.length <= 40 && !out.includes(value)) out.push(value);
+      });
+      return out;
     };
-    const synopsisEl = $(
-      ".summary__content, .synopsis, #synopsis, .sinopsis, [itemprop='description'], .manga-summary, .description-summary",
-    )
-      .filter((_, el) => $(el).text().trim().length > 60)
-      .first();
-    let summary = synopsisEl.length ? readText(synopsisEl) : "";
-    if (summary.length < metaDescription.length) {
-      // og:description sering terpotong; cari blok paragraf yang lebih lengkap
-      for (const candidate of rankContainers($).slice(0, 6)) {
-        const text = readText(candidate.el);
-        if (
-          text.length > Math.max(metaDescription.length, summary.length) &&
-          text.length < 4000 &&
-          !PLACEHOLDER_RE.test(text)
-        ) {
-          summary = text;
-          break;
-        }
-      }
+    const genreList = names('a[href*="/novel-genre/"]');
+    const tagList = names('a[href*="/novel-tag/"]').filter(
+      (tag) => !genreList.includes(tag),
+    );
+    const genres = genreList.concat(tagList).slice(0, 30).join(", ") || undefined;
+
+    const author =
+      $('a[href*="/novel-author/"]').first().text().replace(/\s+/g, " ").trim() ||
+      undefined;
+
+    const badge = h1.parent().text().replace(/\s+/g, " ");
+    const statusWord = (badge.match(/·\s*([A-Za-zÀ-ÿ]+)/)?.[1] || "").toLowerCase();
+    const status = /^(tamat|selesai|completed|complete|end)$/.test(statusWord)
+      ? NovelStatus.Completed
+      : /^(berlanjut|berlangsung|ongoing|berjalan|aktif)$/.test(statusWord)
+        ? NovelStatus.Ongoing
+        : /hiatus/.test(statusWord)
+          ? NovelStatus.OnHiatus
+          : NovelStatus.Unknown;
+
+    let summary = finalSummary;
+    if (
+      this.pagingLog &&
+      (expectedTotal > chapters.length || /nogrow|st\d/.test(this.pagingLog))
+    ) {
+      summary = `${finalSummary || ""}\n\n[paging] ${this.pagingLog} expected=${expectedTotal}`;
     }
-    if (summary.length < metaDescription.length) summary = metaDescription;
-    const finalSummary = summary || undefined;
+    this.pagingLog = "";
 
     return {
       path: novelPath,
       name,
       cover,
-      author: detail(/author/i).text().trim() || undefined,
-      genres:
-        detail(/genre|kategori|tag/i)
-          .find("a")
-          .map((_, element) => $(element).text().trim())
-          .get()
-          .filter(Boolean)
-          .join(", ") || undefined,
-      status: /ongoing|on-going|berjalan/i.test(statusText)
-        ? NovelStatus.Ongoing
-        : /completed|complete|end|tamat|selesai/i.test(statusText)
-          ? NovelStatus.Completed
-          : NovelStatus.Unknown,
-      summary: finalSummary,
+      author,
+      genres,
+      status,
+      summary,
       chapters,
     };
-  }
-
-  private extractEmbedded(rawHtml: string): string | undefined {
-    const scripts = rawHtml.match(/<script\b[^>]*>[\s\S]*?<\/script>/gi) || [];
-    let best = "";
-    for (const script of scripts) {
-      const re = /"((?:[^"\\]|\\.){600,})"/g;
-      let match: RegExpExecArray | null;
-      while ((match = re.exec(script))) {
-        let value = "";
-        try {
-          value = JSON.parse(`"${match[1]}"`);
-        } catch (error) {
-          continue;
-        }
-        if (/^(https?:|data:)/i.test(value)) continue;
-        if (!/\s/.test(value.slice(0, 200))) continue;
-        if (PLACEHOLDER_RE.test(value)) continue;
-        if (value.length > best.length) best = value;
-      }
-    }
-    if (best.length < 600) return undefined;
-    if (/<p[\s>]/i.test(best)) return best;
-    return best
-      .split(/\r?\n\s*\r?\n/)
-      .map((block) => block.trim())
-      .filter(Boolean)
-      .map((block) => `<p>${escapeHtml(block).replace(/\r?\n/g, "<br>")}</p>`)
-      .join("");
-  }
-
-  private async describeDynamic(rawHtml: string, log: string[]): Promise<string> {
-    const $ = parseHTML(rawHtml);
-    const parts: string[] = [];
-    const attrs = (el: Cheerio<AnyNode>) =>
-      Object.entries(el.attr() || {})
-        .filter(([key]) => key !== "style")
-        .map(([key, value]) => `${key}=${String(value).slice(0, 70)}`)
-        .join(";");
-
-    const holder = $("*")
-      .filter(
-        (_, el) =>
-          $(el).children().length === 0 && PLACEHOLDER_RE.test($(el).text()),
-      )
-      .first();
-    if (holder.length) {
-      let node = holder;
-      for (let i = 0; i < 3 && node.length; i++) {
-        parts.push(`h${i}=${labelOf($, node.get(0) as AnyNode)}[${attrs(node)}]`);
-        node = node.parent();
-      }
-    }
-    parts.push(`body[${attrs($("body")).slice(0, 120)}]`);
-    parts.push(
-      `eps=${this.endpointCandidates(rawHtml)
-        .map((url) => url.replace(SITE, "/"))
-        .slice(0, 12)
-        .join(",")}`,
-    );
-    parts.push(`probe=${log.join(" ; ")}`);
-    parts.push(
-      `forms=${$("form")
-        .map((_, el) => `${$(el).attr("method") || "get"}:${$(el).attr("action") || ""}`)
-        .get()
-        .slice(0, 5)
-        .join(",")}`,
-    );
-    parts.push(
-      `xdata=${$("[x-data]")
-        .map((_, el) => ($(el).attr("x-data") || "").replace(/\s+/g, " ").slice(0, 110))
-        .get()
-        .filter(Boolean)
-        .slice(0, 3)
-        .join(" || ")}`,
-    );
-
-    const metas = $("meta[name], meta[property]")
-      .map((_, el) => $(el).attr("name") || $(el).attr("property") || "")
-      .get()
-      .filter((name) => !/viewport|robots|description|theme|generator|^og:|^twitter:/i.test(name))
-      .slice(0, 8);
-    parts.push(`meta=${metas.join(",")}`);
-
-    const skip = /jquery|cloudflare|google|gstatic|adsbygoogle|wp-includes|gtag/i;
-    const srcs = $("script[src]")
-      .map((_, el) => $(el).attr("src") || "")
-      .get()
-      .filter((src) => !skip.test(src));
-    parts.push(
-      `js=${srcs
-        .map((src) => src.replace(/^https?:\/\/[^/]+/, "").split("?")[0].slice(-40))
-        .slice(0, 6)
-        .join(",")}`,
-    );
-
-    let bundle = $("script:not([src])")
-      .map((_, el) => $(el).html() || "")
-      .get()
-      .join("\n");
-    const sameOrigin = srcs
-      .filter((src) => /^(https?:)?\/\/(www\.)?meionovels\.com|^\//.test(src))
-      .slice(0, 3);
-    for (const src of sameOrigin) {
-      bundle += `\n${await this.getText(absoluteUrl(src))}`;
-    }
-
-    const grep = (re: RegExp, count: number, group = 0) => {
-      const out: string[] = [];
-      let match: RegExpExecArray | null;
-      while ((match = re.exec(bundle)) && out.length < count) {
-        const value = (match[group] || match[0]).slice(0, 90);
-        if (!out.includes(value)) out.push(value);
-      }
-      return out.join(",");
-    };
-    parts.push(`wpjson=${grep(/wp-json\/[A-Za-z0-9_\-\/.]+/g, 6)}`);
-    parts.push(`api=${grep(/["'`](\/?api\/[A-Za-z0-9_\-\/.{}$]+)/g, 5, 1)}`);
-    parts.push(`action=${grep(/action\s*[:=]\s*["']([A-Za-z0-9_\-]+)["']/g, 6, 1)}`);
-    parts.push(`fetch=${grep(/fetch\(([^)]{0,90})\)?/g, 4, 1)}`);
-    return parts.join(" | ").slice(0, 2400);
   }
 
   async parseChapter(chapterPath: string): Promise<string> {
     const cleanPath = normalizePath(chapterPath);
     const { $, html: rawHtml } = await this.getHtml(`${SITE}${cleanPath}/`);
     $(
-      "script, style, noscript, iframe, .ads, .ad, .adsbygoogle, .chapter-nav, .nav-links, .wp-manga-nav, nav, header, footer, form, .comments, #comments",
+      "script, style, noscript, iframe, .trap-link, .ads, .ad, .adsbygoogle, .chapter-nav, .nav-links, .wp-manga-nav, nav, header, footer, form, .comments, #comments",
     ).remove();
 
     const finish = (content: Cheerio<AnyNode>) => {
@@ -1248,7 +1232,7 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
       }
     }
     const api = await this.contentViaApi(rawHtml, `${SITE}${cleanPath}/`);
-    if (api.html) return api.html;
+    if (api.html) return dedupeLeading(api.html);
 
     // 1) selector yang umum dipakai tema novel
     for (const selector of [
@@ -1281,16 +1265,7 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
     const embedded = this.extractEmbedded(rawHtml);
     if (embedded) return embedded;
 
-    const viaApi = await this.contentFromEndpoints(
-      rawHtml,
-      `${SITE}${cleanPath}/`,
-    );
-    if (viaApi.html) return viaApi.html;
-
-    const dynamic = await this.describeDynamic(rawHtml, [
-      `api=${api.log}`,
-      ...viaApi.log,
-    ]);
+    const dynamic = await this.describeDynamic(rawHtml, [`api=${api.log}`]);
     throw new Error(
       `MeioNovel chapter content is loaded by JS: ${cleanPath} | DYN: ${dynamic}`,
     );
