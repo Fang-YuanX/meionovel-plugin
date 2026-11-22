@@ -406,13 +406,142 @@ var readXData = function (xdata, keys) {
     }
     return readConfig(xdata, keys);
 };
+// ---- Normalisasi isi chapter supaya TTS membaca per paragraf ----
+var MAX_TTS_CHUNK = 450;
+var splitForTts = function (text) {
+    var sentences = text.match(/[^.!?…。！？]+(?:[.!?…。！？]+["”’')\]]*|$)\s*/g) || [text];
+    var chunks = [];
+    var current = "";
+    var pushCurrent = function () {
+        var value = current.trim();
+        if (value)
+            chunks.push(value);
+        current = "";
+    };
+    sentences.forEach(function (sentence) {
+        if (current && (current + sentence).length > MAX_TTS_CHUNK)
+            pushCurrent();
+        current += sentence;
+    });
+    pushCurrent();
+    // kalimat tanpa tanda baca yang sangat panjang: potong per kata
+    var out = [];
+    chunks.forEach(function (chunk) {
+        if (chunk.length <= MAX_TTS_CHUNK * 2) {
+            out.push(chunk);
+            return;
+        }
+        var piece = "";
+        chunk.split(/\s+/).forEach(function (word) {
+            if (piece && (piece + " " + word).length > MAX_TTS_CHUNK) {
+                out.push(piece);
+                piece = "";
+            }
+            piece = piece ? "".concat(piece, " ").concat(word) : word;
+        });
+        if (piece)
+            out.push(piece);
+    });
+    return out;
+};
+var BLOCK_TAG_RE = /^(p|div|section|article|blockquote|ul|ol|li|table|tbody|tr|td|figure|center|main)$/;
+var normalizeContent = function (html) {
+    var $ = (0, cheerio_1.load)("<div id=\"mn-root\">".concat(html, "</div>"));
+    var blocks = [];
+    var buffer = "";
+    var plainOf = function (fragment) {
+        return fragment
+            .replace(/<[^>]+>/g, "")
+            .replace(/&nbsp;|\u00a0/g, " ")
+            .replace(/&amp;/g, "&")
+            .replace(/&lt;/g, "<")
+            .replace(/&gt;/g, ">")
+            .replace(/\s+/g, " ")
+            .trim();
+    };
+    var flush = function () {
+        var fragment = buffer.trim();
+        buffer = "";
+        var plain = plainOf(fragment);
+        if (!plain)
+            return;
+        blocks.push({ html: "<p>".concat(fragment, "</p>"), plain: plain });
+    };
+    var walk = function (nodes, insideParagraph) {
+        nodes.each(function (_, node) {
+            var item = node;
+            if (item.type === "text") {
+                var text = String(item.data || "");
+                if (insideParagraph) {
+                    buffer += escapeHtml(text.replace(/\s*\r?\n\s*/g, " "));
+                }
+                else {
+                    text.split(/\r?\n/).forEach(function (part, index) {
+                        if (index > 0)
+                            flush();
+                        buffer += escapeHtml(part);
+                    });
+                }
+                return;
+            }
+            if (item.type !== "tag")
+                return;
+            var tag = String(item.name || "").toLowerCase();
+            var el = $(node);
+            if (tag === "script" || tag === "style")
+                return;
+            if (tag === "br") {
+                flush();
+            }
+            else if (tag === "hr") {
+                flush();
+                blocks.push({ html: "<hr>" });
+            }
+            else if (tag === "img") {
+                flush();
+                blocks.push({ html: $.html(node) });
+            }
+            else if (/^h[1-6]$/.test(tag)) {
+                flush();
+                var plain = plainOf(el.html() || "");
+                if (plain)
+                    blocks.push({ html: "<".concat(tag, ">").concat(el.html(), "</").concat(tag, ">"), plain: plain });
+            }
+            else if (BLOCK_TAG_RE.test(tag)) {
+                flush();
+                walk(el.contents(), tag === "p" ? true : insideParagraph);
+                flush();
+            }
+            else if (el.find("br").length) {
+                walk(el.contents(), insideParagraph);
+            }
+            else {
+                buffer += $.html(node);
+            }
+        });
+    };
+    walk($("#mn-root").contents(), false);
+    flush();
+    var out = [];
+    blocks.forEach(function (block) {
+        if (block.plain && block.plain.length > MAX_TTS_CHUNK + 150) {
+            splitForTts(block.plain).forEach(function (chunk) {
+                return out.push("<p>".concat(escapeHtml(chunk), "</p>"));
+            });
+        }
+        else {
+            out.push(block.html);
+        }
+    });
+    return out.join("");
+};
 var MeioNovelCustomPlugin = /** @class */ (function () {
     function MeioNovelCustomPlugin() {
         this.id = "meionovel";
         this.name = "MeioNovel Custom";
         this.icon = "src/id/meionovel/icon.png";
         this.site = SITE;
-        this.version = "3.1.3";
+        this.version = "3.1.4";
         this.imageRequestInit = {
             headers: { Referer: SITE },
         };
@@ -447,7 +576,11 @@ var MeioNovelCustomPlugin = /** @class */ (function () {
         });
     };
     MeioNovelCustomPlugin.prototype.parseNovels = function ($) {
+        $(".trap-link").remove(); // jebakan anti-bot
         var novels = new Map();
+        var isGoodName = function (text) {
+            return text.length >= 2 && !/^[\d\s.,#]*$/.test(text);
+        }; // angka saja = nomor peringkat
         var findScope = function (link) {
             var card = link.closest(CARD_SELECTOR);
             if (card.length)
@@ -466,7 +599,7 @@ var MeioNovelCustomPlugin = /** @class */ (function () {
                 if (paths.size === 1 && node.find("img").length)
                     return { value: node };
             };
-            for (var i = 0; i < 2; i++) {
+            for (var i = 0; i < 3; i++) {
                 var state_1 = _loop_1(i);
                 if (typeof state_1 === "object")
                     return state_1.value;
@@ -480,30 +613,33 @@ var MeioNovelCustomPlugin = /** @class */ (function () {
             ".page-item-detail",
             ".novel-item",
         ].find(function (selector) { return $(selector).length > 0; });
+        var root = $("#konten").length
+            ? $("#konten")
+            : $("main").length
+                ? $("main")
+                : $.root();
         var anchors = resultSelector
             ? $(resultSelector).find("a[href]")
-            : $("a[href]");
+            : root.find("a[href]");
         anchors.each(function (_, element) {
-            var _a, _b;
             var link = $(element);
             var path = getNovelPath(link.attr("href") || "");
             if (!path)
                 return;
             var scope = findScope(link);
-            var inCard = scope.is(CARD_SELECTOR);
-            var name = (inCard
-                ? scope.find(".post-title, h3, h2").first().text().trim()
-                : "") ||
-                ((_a = link.attr("title")) === null || _a === void 0 ? void 0 : _a.trim()) ||
-                link.text().trim() ||
-                ((_b = scope.find("img").first().attr("alt")) === null || _b === void 0 ? void 0 : _b.trim()) ||
-                "";
+            var clean = function (value) { return (value || "").replace(/\s+/g, " ").trim(); };
+            var name = [
+                clean(scope.find("h1, h2, h3, h4, .post-title").first().text()),
+                clean(link.attr("title")),
+                clean(scope.find("img").first().attr("alt")).replace(/^cover\s*(of\s*)?/i, ""),
+                clean(link.text()),
+            ].find(isGoodName) || "";
             var cover = getCover(scope);
             var existing = novels.get(path);
             if (existing) {
                 if (!existing.cover && cover)
                     existing.cover = cover;
-                if (!existing.name && name)
+                if (!isGoodName(existing.name) && name)
                     existing.name = name;
                 return;
             }
@@ -511,7 +647,7 @@ var MeioNovelCustomPlugin = /** @class */ (function () {
                 return;
             novels.set(path, { name: name, path: path, cover: cover });
         });
-        return Array.from(novels.values());
+        return Array.from(novels.values()).filter(function (novel) { return isGoodName(novel.name); });
     };
     MeioNovelCustomPlugin.prototype.dedupe = function (key, pageNo, novels) {
         if (pageNo <= 1 || !this.seenPaths.has(key)) {
@@ -667,27 +803,78 @@ var MeioNovelCustomPlugin = /** @class */ (function () {
             });
         });
     };
+    MeioNovelCustomPlugin.prototype.suggestNovels = function (searchTerm) {
+        return __awaiter(this, void 0, Promise, function () {
+            var text, json, items, out;
+            return __generator(this, function (_a) {
+                switch (_a.label) {
+                    case 0: return [4 /*yield*/, this.getText("".concat(SITE, "cari/saran?q=").concat(encodeURIComponent(searchTerm)), { Accept: "application/json", "X-Requested-With": "XMLHttpRequest" })];
+                    case 1:
+                        text = _a.sent();
+                        if (!text)
+                            return [2 /*return*/, []];
+                        try {
+                            json = JSON.parse(text);
+                        }
+                        catch (error) {
+                            return [2 /*return*/, []];
+                        }
+                        items = Array.isArray(json === null || json === void 0 ? void 0 : json.items) ? json.items : [];
+                        out = [];
+                        items.forEach(function (item) {
+                            var path = getNovelPath(String((item === null || item === void 0 ? void 0 : item.url) || ""));
+                            var name = String((item === null || item === void 0 ? void 0 : item.title) || "").replace(/\s+/g, " ").trim();
+                            if (!path || !name)
+                                return;
+                            var cover = isUsableUrl(item === null || item === void 0 ? void 0 : item.cover) ? absoluteUrl(item.cover) : undefined;
+                            out.push({ name: name, path: path, cover: cover });
+                        });
+                        return [2 /*return*/, out];
+                }
+            });
+        });
+    };
     MeioNovelCustomPlugin.prototype.searchNovels = function (searchTerm, pageNo) {
         return __awaiter(this, void 0, Promise, function () {
-            var query, $, error_3;
+            var term, results, $, error_3, merged;
             return __generator(this, function (_a) {
                 switch (_a.label) {
                     case 0:
-                        query = encodeURIComponent(searchTerm);
-                        _a.label = 1;
-                    case 1:
-                        _a.trys.push([1, 3, , 4]);
-                        return [4 /*yield*/, this.getHtml("".concat(SITE, "page/").concat(pageNo, "/?s=").concat(query, "&post_type=wp-manga"))];
-                    case 2:
-                        $ = (_a.sent()).$;
-                        return [2 /*return*/, this.dedupe("search:".concat(query), pageNo, this.parseNovels($))];
-                    case 3:
-                        error_3 = _a.sent();
-                        if (pageNo > 1 && /\(404\)/.test(String(error_3 === null || error_3 === void 0 ? void 0 : error_3.message))) {
+                        term = searchTerm.trim();
+                        if (!term)
                             return [2 /*return*/, []];
+                        results = [];
+                        if (!(pageNo <= 1)) return [3 /*break*/, 2];
+                        return [4 /*yield*/, this.suggestNovels(term)];
+                    case 1:
+                        (_a.sent()).forEach(function (novel) { return results.push(novel); });
+                        _a.label = 2;
+                    case 2:
+                        _a.trys.push([2, 4, , 5]);
+                        return [4 /*yield*/, this.getHtml("".concat(SITE, "jelajahi?q=").concat(encodeURIComponent(term), "&page=").concat(pageNo))];
+                    case 3:
+                        $ = (_a.sent()).$;
+                        this.parseNovels($).forEach(function (novel) { return results.push(novel); });
+                        return [3 /*break*/, 5];
+                    case 4:
+                        error_3 = _a.sent();
+                        if (pageNo > 1 || results.length) {
+                            // halaman habis atau tidak ada; pakai hasil yang sudah ada
                         }
-                        throw error_3;
-                    case 4: return [2 /*return*/];
+                        else {
+                            throw error_3;
+                        }
+                        return [3 /*break*/, 5];
+                    case 5:
+                        merged = new Map();
+                        results.forEach(function (novel) {
+                            var existing = merged.get(novel.path);
+                            if (!existing)
+                                merged.set(novel.path, novel);
+                            else if (!existing.cover && novel.cover)
+                                existing.cover = novel.cover;
+                        });
+                        return [2 /*return*/, this.dedupe("search:".concat(term), pageNo, Array.from(merged.values()))];
                 }
             });
         });
@@ -1393,18 +1580,7 @@ var MeioNovelCustomPlugin = /** @class */ (function () {
                         _a = _g.sent(), $ = _a.$, rawHtml = _a.html;
                         $("script, style, noscript, iframe, .trap-link, .ads, .ad, .adsbygoogle, .chapter-nav, .nav-links, .wp-manga-nav, nav, header, footer, form, .comments, #comments").remove();
                         finish = function (content) {
-                            var _a;
-                            content.find("p").each(function (_, element) {
-                                var paragraph = $(element);
-                                if (!paragraph.find("br").length)
-                                    return;
-                                var lines = (paragraph.html() || "")
-                                    .split(/<br\s*\/?>/i)
-                                    .map(function (line) { return line.replace(/\uFEFF/g, "").trim(); })
-                                    .filter(function (line) { return line.replace(/&nbsp;|\u00a0/g, "").trim(); });
-                                paragraph.replaceWith(lines.map(function (line) { return "<p>".concat(line, "</p>"); }).join(""));
-                            });
-                            return (_a = content.html()) === null || _a === void 0 ? void 0 : _a.trim();
+                            return dedupeLeading(normalizeContent(content.html() || "")) || undefined;
                         };
                         usable = function (content, min) {
                             var text = content.text().replace(/\s+/g, " ").trim();
@@ -1424,7 +1600,7 @@ var MeioNovelCustomPlugin = /** @class */ (function () {
                     case 2:
                         api = _g.sent();
                         if (api.html)
-                            return [2 /*return*/, dedupeLeading(api.html)];
+                            return [2 /*return*/, dedupeLeading(normalizeContent(api.html))];
                         // 1) selector yang umum dipakai tema novel
                         for (_c = 0, _d = [
                             ".reading-content",
@@ -1458,7 +1634,7 @@ var MeioNovelCustomPlugin = /** @class */ (function () {
                         }
                         embedded = this.extractEmbedded(rawHtml);
                         if (embedded)
-                            return [2 /*return*/, embedded];
+                            return [2 /*return*/, dedupeLeading(normalizeContent(embedded))];
                         return [4 /*yield*/, this.describeDynamic(rawHtml, ["api=".concat(api.log)])];
                     case 3:
                         dynamic = _g.sent();
