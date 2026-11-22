@@ -362,12 +362,134 @@ const readXData = (xdata: string, keys: string[]): Record<string, string> => {
   return readConfig(xdata, keys);
 };
 
+// ---- Normalisasi isi chapter supaya TTS membaca per paragraf ----
+const MAX_TTS_CHUNK = 450;
+
+const splitForTts = (text: string): string[] => {
+  const sentences =
+    text.match(/[^.!?…。！？]+(?:[.!?…。！？]+["”’')\]]*|$)\s*/g) || [text];
+  const chunks: string[] = [];
+  let current = "";
+  const pushCurrent = () => {
+    const value = current.trim();
+    if (value) chunks.push(value);
+    current = "";
+  };
+  sentences.forEach((sentence) => {
+    if (current && (current + sentence).length > MAX_TTS_CHUNK) pushCurrent();
+    current += sentence;
+  });
+  pushCurrent();
+  // kalimat tanpa tanda baca yang sangat panjang: potong per kata
+  const out: string[] = [];
+  chunks.forEach((chunk) => {
+    if (chunk.length <= MAX_TTS_CHUNK * 2) {
+      out.push(chunk);
+      return;
+    }
+    let piece = "";
+    chunk.split(/\s+/).forEach((word) => {
+      if (piece && (piece + " " + word).length > MAX_TTS_CHUNK) {
+        out.push(piece);
+        piece = "";
+      }
+      piece = piece ? `${piece} ${word}` : word;
+    });
+    if (piece) out.push(piece);
+  });
+  return out;
+};
+
+const BLOCK_TAG_RE = /^(p|div|section|article|blockquote|ul|ol|li|table|tbody|tr|td|figure|center|main)$/;
+
+const normalizeContent = (html: string): string => {
+  const $ = parseHTML(`<div id="mn-root">${html}</div>`);
+  const blocks: { html: string; plain?: string }[] = [];
+  let buffer = "";
+
+  const plainOf = (fragment: string) =>
+    fragment
+      .replace(/<[^>]+>/g, "")
+      .replace(/&nbsp;|\u00a0/g, " ")
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/\s+/g, " ")
+      .trim();
+
+  const flush = () => {
+    const fragment = buffer.trim();
+    buffer = "";
+    const plain = plainOf(fragment);
+    if (!plain) return;
+    blocks.push({ html: `<p>${fragment}</p>`, plain });
+  };
+
+  const walk = (nodes: Cheerio<AnyNode>, insideParagraph: boolean) => {
+    nodes.each((_, node) => {
+      const item = node as unknown as { type: string; data?: string; name?: string };
+      if (item.type === "text") {
+        const text = String(item.data || "");
+        if (insideParagraph) {
+          buffer += escapeHtml(text.replace(/\s*\r?\n\s*/g, " "));
+        } else {
+          text.split(/\r?\n/).forEach((part, index) => {
+            if (index > 0) flush();
+            buffer += escapeHtml(part);
+          });
+        }
+        return;
+      }
+      if (item.type !== "tag") return;
+      const tag = String(item.name || "").toLowerCase();
+      const el = $(node);
+      if (tag === "script" || tag === "style") return;
+      if (tag === "br") {
+        flush();
+      } else if (tag === "hr") {
+        flush();
+        blocks.push({ html: "<hr>" });
+      } else if (tag === "img") {
+        flush();
+        blocks.push({ html: $.html(node) });
+      } else if (/^h[1-6]$/.test(tag)) {
+        flush();
+        const plain = plainOf(el.html() || "");
+        if (plain) blocks.push({ html: `<${tag}>${el.html()}</${tag}>`, plain });
+      } else if (BLOCK_TAG_RE.test(tag)) {
+        flush();
+        walk(el.contents(), tag === "p" ? true : insideParagraph);
+        flush();
+      } else if (el.find("br").length) {
+        walk(el.contents(), insideParagraph);
+      } else {
+        buffer += $.html(node);
+      }
+    });
+  };
+
+  walk($("#mn-root").contents(), false);
+  flush();
+
+  const out: string[] = [];
+  blocks.forEach((block) => {
+    if (block.plain && block.plain.length > MAX_TTS_CHUNK + 150) {
+      splitForTts(block.plain).forEach((chunk) =>
+        out.push(`<p>${escapeHtml(chunk)}</p>`),
+      );
+    } else {
+      out.push(block.html);
+    }
+  });
+  return out.join("");
+};
+
 class MeioNovelCustomPlugin implements Plugin.PluginBase {
   id = "meionovel";
   name = "MeioNovel Custom";
   icon = "src/id/meionovel/icon.png";
   site = SITE;
-  version = "3.1.3";
+  version = "3.1.4";
   imageRequestInit: Plugin.ImageRequestInit = {
     headers: { Referer: SITE },
   };
@@ -398,13 +520,16 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
   }
 
   private parseNovels($: CheerioAPI): Plugin.NovelItem[] {
+    $(".trap-link").remove(); // jebakan anti-bot
     const novels = new Map<string, Plugin.NovelItem>();
+    const isGoodName = (text: string) =>
+      text.length >= 2 && !/^[\d\s.,#]*$/.test(text); // angka saja = nomor peringkat
 
     const findScope = (link: Cheerio<AnyNode>): Cheerio<AnyNode> => {
       const card = link.closest(CARD_SELECTOR);
       if (card.length) return card;
       let node = link;
-      for (let i = 0; i < 2; i++) {
+      for (let i = 0; i < 3; i++) {
         node = node.parent();
         if (!node.length) break;
         const paths = new Set<string>();
@@ -422,9 +547,14 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
       ".page-item-detail",
       ".novel-item",
     ].find((selector) => $(selector).length > 0);
+    const root = $("#konten").length
+      ? $("#konten")
+      : $("main").length
+        ? $("main")
+        : $.root();
     const anchors = resultSelector
       ? $(resultSelector).find("a[href]")
-      : $("a[href]");
+      : root.find("a[href]");
 
     anchors.each((_, element) => {
       const link = $(element);
@@ -432,28 +562,30 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
       if (!path) return;
 
       const scope = findScope(link);
-      const inCard = scope.is(CARD_SELECTOR);
+      const clean = (value?: string) => (value || "").replace(/\s+/g, " ").trim();
       const name =
-        (inCard
-          ? scope.find(".post-title, h3, h2").first().text().trim()
-          : "") ||
-        link.attr("title")?.trim() ||
-        link.text().trim() ||
-        scope.find("img").first().attr("alt")?.trim() ||
-        "";
+        [
+          clean(scope.find("h1, h2, h3, h4, .post-title").first().text()),
+          clean(link.attr("title")),
+          clean(scope.find("img").first().attr("alt")).replace(
+            /^cover\s*(of\s*)?/i,
+            "",
+          ),
+          clean(link.text()),
+        ].find(isGoodName) || "";
       const cover = getCover(scope);
 
       const existing = novels.get(path);
       if (existing) {
         if (!existing.cover && cover) existing.cover = cover;
-        if (!existing.name && name) existing.name = name;
+        if (!isGoodName(existing.name) && name) existing.name = name;
         return;
       }
       if (!name) return;
       novels.set(path, { name, path, cover });
     });
 
-    return Array.from(novels.values());
+    return Array.from(novels.values()).filter((novel) => isGoodName(novel.name));
   }
 
   private seenPaths = new Map<string, Set<string>>();
@@ -595,22 +727,62 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
     }
   }
 
+  private async suggestNovels(searchTerm: string): Promise<Plugin.NovelItem[]> {
+    const text = await this.getText(
+      `${SITE}cari/saran?q=${encodeURIComponent(searchTerm)}`,
+      { Accept: "application/json", "X-Requested-With": "XMLHttpRequest" },
+    );
+    if (!text) return [];
+    let json: any;
+    try {
+      json = JSON.parse(text);
+    } catch (error) {
+      return [];
+    }
+    const items: any[] = Array.isArray(json?.items) ? json.items : [];
+    const out: Plugin.NovelItem[] = [];
+    items.forEach((item) => {
+      const path = getNovelPath(String(item?.url || ""));
+      const name = String(item?.title || "").replace(/\s+/g, " ").trim();
+      if (!path || !name) return;
+      const cover = isUsableUrl(item?.cover) ? absoluteUrl(item.cover) : undefined;
+      out.push({ name, path, cover });
+    });
+    return out;
+  }
+
   async searchNovels(
     searchTerm: string,
     pageNo: number,
   ): Promise<Plugin.NovelItem[]> {
-    const query = encodeURIComponent(searchTerm);
+    const term = searchTerm.trim();
+    if (!term) return [];
+    const results: Plugin.NovelItem[] = [];
+    // saran pencarian situs: judul + cover bersih (halaman pertama)
+    if (pageNo <= 1) {
+      (await this.suggestNovels(term)).forEach((novel) => results.push(novel));
+    }
+    // halaman hasil lengkap /jelajahi?q=...&page=N
     try {
       const { $ } = await this.getHtml(
-        `${SITE}page/${pageNo}/?s=${query}&post_type=wp-manga`,
+        `${SITE}jelajahi?q=${encodeURIComponent(term)}&page=${pageNo}`,
       );
-      return this.dedupe(`search:${query}`, pageNo, this.parseNovels($));
+      this.parseNovels($).forEach((novel) => results.push(novel));
     } catch (error) {
-      if (pageNo > 1 && /\(404\)/.test(String((error as Error)?.message))) {
-        return [];
+      if (pageNo > 1 || results.length) {
+        // halaman habis atau tidak ada; pakai hasil yang sudah ada
+      } else {
+        throw error;
       }
-      throw error;
     }
+    // gabung per path (saran lebih bersih, jadi didahulukan)
+    const merged = new Map<string, Plugin.NovelItem>();
+    results.forEach((novel) => {
+      const existing = merged.get(novel.path);
+      if (!existing) merged.set(novel.path, novel);
+      else if (!existing.cover && novel.cover) existing.cover = novel.cover;
+    });
+    return this.dedupe(`search:${term}`, pageNo, Array.from(merged.values()));
   }
 
   private discoverChapters(
@@ -1221,18 +1393,8 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
       "script, style, noscript, iframe, .trap-link, .ads, .ad, .adsbygoogle, .chapter-nav, .nav-links, .wp-manga-nav, nav, header, footer, form, .comments, #comments",
     ).remove();
 
-    const finish = (content: Cheerio<AnyNode>) => {
-      content.find("p").each((_, element) => {
-        const paragraph = $(element);
-        if (!paragraph.find("br").length) return;
-        const lines = (paragraph.html() || "")
-          .split(/<br\s*\/?>/i)
-          .map((line) => line.replace(/\uFEFF/g, "").trim())
-          .filter((line) => line.replace(/&nbsp;|\u00a0/g, "").trim());
-        paragraph.replaceWith(lines.map((line) => `<p>${line}</p>`).join(""));
-      });
-      return content.html()?.trim();
-    };
+    const finish = (content: Cheerio<AnyNode>) =>
+      dedupeLeading(normalizeContent(content.html() || "")) || undefined;
 
     const usable = (content: Cheerio<AnyNode>, min: number) => {
       const text = content.text().replace(/\s+/g, " ").trim();
@@ -1248,7 +1410,7 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
       }
     }
     const api = await this.contentViaApi(rawHtml, `${SITE}${cleanPath}/`);
-    if (api.html) return dedupeLeading(api.html);
+    if (api.html) return dedupeLeading(normalizeContent(api.html));
 
     // 1) selector yang umum dipakai tema novel
     for (const selector of [
@@ -1279,7 +1441,7 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
 
     // 3) isi chapter ditanam sebagai JSON di dalam script
     const embedded = this.extractEmbedded(rawHtml);
-    if (embedded) return embedded;
+    if (embedded) return dedupeLeading(normalizeContent(embedded));
 
     const dynamic = await this.describeDynamic(rawHtml, [`api=${api.log}`]);
     throw new Error(
