@@ -367,7 +367,7 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
   name = "MeioNovel Custom";
   icon = "src/id/meionovel/icon.png";
   site = SITE;
-  version = "3.1.2";
+  version = "3.1.3";
   imageRequestInit: Plugin.ImageRequestInit = {
     headers: { Referer: SITE },
   };
@@ -911,7 +911,40 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
     return { log: "retry-exhausted" };
   }
 
-  // Daftar chapter: POST {novel, token, params} -> {html} (berpaginasi lewat params.page)
+  // Baris daftar chapter dari balasan API: <a href=".../chapter-N/"><span>Chapter N</span>
+  // <span>judul</span><time datetime="...">tanggal</time></a>
+  private parseListRows(html: string, cleanPath: string): Plugin.ChapterItem[] {
+    const $ = parseHTML(html);
+    $(".trap-link").remove(); // jebakan anti-bot
+    const base = `${cleanPath}/`;
+    const rows: Plugin.ChapterItem[] = [];
+    const seen = new Set<string>();
+    $("a[href]").each((_, element) => {
+      const link = $(element);
+      const path = getChapterPath(link.attr("href") || "");
+      if (!path || !path.startsWith(base) || seen.has(path)) return;
+      const rest = path.slice(base.length);
+      if (!rest || /^(ajax|feed|comments?|embed|amp|page)(\/|$)/i.test(rest)) {
+        return;
+      }
+      const spans = link.children("span");
+      const label = spans.eq(0).text().replace(/\s+/g, " ").trim();
+      const title = spans.eq(1).text().replace(/\s+/g, " ").trim();
+      const time = link.find("time").first();
+      if (!label && !time.length) return; // bukan baris chapter
+      seen.add(path);
+      const fullName = label ? (title ? `${label}: ${title}` : label) : link.text();
+      rows.push({
+        name: cleanChapterName(fullName) || prettyChapterName(rest),
+        path,
+        releaseTime: time.attr("datetime") || time.text().trim() || undefined,
+      });
+    });
+    return rows;
+  }
+
+  // Daftar chapter: POST {novel, token, params} -> {html}. Grup 100 chapter per
+  // params.page; semua grup diikuti sesuai urutan situs (tanpa diurutkan ulang).
   private async chaptersViaApi(
     pageHtml: string,
     cleanPath: string,
@@ -956,34 +989,46 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
       const first = await this.postJsonRetry(url, makeBody({}), csrf, referer);
       if (first.status === 419) return [];
       if (!first.ok || typeof first.data?.html !== "string") return [];
+      const firstHtml: string = first.data.html;
 
-      let found = this.discoverChapters(first.data.html, cleanPath, []);
-      const pageNumbers = (
-        (first.data.html.match(/(?:[?&]|&amp;)page=(\d+)/g) || []).concat(
-          first.data.html.match(/data-page=["'](\d+)/g) || [],
-        ) as string[]
-      ).map((m: string) => Number(m.replace(/\D/g, "")));
-      let maxPage = Math.max.apply(null, [1].concat(pageNumbers));
-      ["last_page", "total_pages", "pages", "page_count", "max_page"].forEach(
-        (key) => {
-          const value = Number(first.data[key]);
-          if (value > maxPage) maxPage = value;
-        },
+      const rows: Plugin.ChapterItem[] = [];
+      const seen = new Set<string>();
+      const addRows = (items: Plugin.ChapterItem[]) => {
+        let added = 0;
+        items.forEach((item) => {
+          if (seen.has(item.path)) return;
+          seen.add(item.path);
+          rows.push(item);
+          added++;
+        });
+        return added;
+      };
+      addRows(this.parseListRows(firstHtml, cleanPath));
+
+      // jumlah grup: dari dropdown "Pilih grup chapter" dan pager
+      const pageNumbers: number[] = [1];
+      (firstHtml.match(/[?&;]page=(\d+)/g) || []).forEach((m: string) =>
+        pageNumbers.push(Number(m.replace(/\D/g, ""))),
       );
-      if (expectedTotal > found.length) {
-        maxPage = Math.max(
-          maxPage,
-          Math.ceil(expectedTotal / Math.max(1, found.length)),
-        );
-      }
-      const log: string[] = [`p1:${found.length} max=${maxPage}`];
+      (firstHtml.match(/Halaman\s+(\d+)/g) || []).forEach((m: string) =>
+        pageNumbers.push(Number(m.replace(/\D/g, ""))),
+      );
+      let maxPage = Math.max.apply(null, pageNumbers);
+      const totalMatch = firstHtml.match(/dari\s+([\d.,]+)\s+chapter/i);
+      const apiTotal = totalMatch ? Number(totalMatch[1].replace(/[.,]/g, "")) : 0;
+      const groupMatch = firstHtml.match(/Grup\s+(\d+)\s*[–-]\s*(\d+)/);
+      const groupSize = groupMatch
+        ? Math.max(1, Number(groupMatch[2]) - Number(groupMatch[1]) + 1)
+        : 100;
+      const total = apiTotal || expectedTotal;
+      if (total) maxPage = Math.max(maxPage, Math.ceil(total / groupSize));
 
-      // A) paginasi lewat params.page
-      let stoppedEarly = false;
-      for (let page = 2; page <= 800; page++) {
-        if (maxPage > 1 && page > maxPage) break;
-        if (expectedTotal && found.length >= expectedTotal) break;
-        await sleep(120);
+      const log: string[] = [
+        `p1:${rows.length} max=${maxPage} total=${total} grup=${groupSize}`,
+      ];
+      let emptyRun = 0;
+      for (let page = 2; page <= Math.min(maxPage, 400); page++) {
+        await sleep(150);
         const res = await this.postJsonRetry(
           url,
           makeBody({ page: String(page) }),
@@ -992,50 +1037,21 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
         );
         if (!res.ok || typeof res.data?.html !== "string") {
           log.push(`p${page}:st${res.status}`);
-          stoppedEarly = true;
           break;
         }
-        const merged = this.discoverChapters(res.data.html, cleanPath, found);
-        if (merged.length <= found.length) {
-          log.push(`p${page}:nogrow`);
-          stoppedEarly = maxPage <= 1 ? page === 2 : true;
-          break;
-        }
-        found = merged;
-      }
-
-      // B) cadangan: lompat ke chapter berikutnya bila params.page tidak jalan
-      if (
-        stoppedEarly &&
-        found.length >= 50 &&
-        (!expectedTotal || found.length < expectedTotal)
-      ) {
-        for (let step = 0; step < 800; step++) {
-          const lastPath = found[found.length - 1].path;
-          const lastNumber =
-            chapterNumberOf(lastPath.slice(`${cleanPath}/`.length)) || found.length;
-          await sleep(120);
-          const res = await this.postJsonRetry(
-            url,
-            makeBody({ lompat: String(lastNumber + 1) }),
-            csrf,
-            referer,
-          );
-          if (!res.ok || typeof res.data?.html !== "string") {
-            log.push(`j${lastNumber + 1}:st${res.status}`);
-            break;
-          }
-          const merged = this.discoverChapters(res.data.html, cleanPath, found);
-          if (merged.length <= found.length) {
-            log.push(`j${lastNumber + 1}:nogrow`);
-            break;
-          }
-          found = merged;
+        const added = addRows(this.parseListRows(res.data.html, cleanPath));
+        if (added === 0) {
+          emptyRun++;
+          log.push(`p${page}:kosong`);
+          if (emptyRun >= 5) break; // beberapa grup kosong berturut-turut
+        } else {
+          emptyRun = 0;
         }
       }
-      log.push(`total=${found.length}`);
+      log.push(`total=${rows.length}`);
       this.pagingLog = log.join(" ");
-      return found;
+
+      return rows.map((row, index) => ({ ...row, chapterNumber: index + 1 }));
     };
 
     let chapters = await attempt(pageHtml, novelUrl);
@@ -1180,7 +1196,7 @@ class MeioNovelCustomPlugin implements Plugin.PluginBase {
     let summary = finalSummary;
     if (
       this.pagingLog &&
-      (expectedTotal > chapters.length || /nogrow|st\d/.test(this.pagingLog))
+      (expectedTotal > chapters.length || /st\d/.test(this.pagingLog))
     ) {
       summary = `${finalSummary || ""}\n\n[paging] ${this.pagingLog} expected=${expectedTotal}`;
     }
