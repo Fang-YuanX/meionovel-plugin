@@ -412,7 +412,7 @@ var MeioNovelCustomPlugin = /** @class */ (function () {
         this.name = "MeioNovel Custom";
         this.icon = "src/id/meionovel/icon.png";
         this.site = SITE;
-        this.version = "3.1.2";
+        this.version = "3.1.3";
         this.imageRequestInit = {
             headers: { Referer: SITE },
         };
@@ -1063,7 +1063,41 @@ var MeioNovelCustomPlugin = /** @class */ (function () {
             });
         });
     };
-    // Daftar chapter: POST {novel, token, params} -> {html} (berpaginasi lewat params.page)
+    // Baris daftar chapter dari balasan API: <a href=".../chapter-N/"><span>Chapter N</span>
+    // <span>judul</span><time datetime="...">tanggal</time></a>
+    MeioNovelCustomPlugin.prototype.parseListRows = function (html, cleanPath) {
+        var $ = (0, cheerio_1.load)(html);
+        $(".trap-link").remove(); // jebakan anti-bot
+        var base = "".concat(cleanPath, "/");
+        var rows = [];
+        var seen = new Set();
+        $("a[href]").each(function (_, element) {
+            var link = $(element);
+            var path = getChapterPath(link.attr("href") || "");
+            if (!path || !path.startsWith(base) || seen.has(path))
+                return;
+            var rest = path.slice(base.length);
+            if (!rest || /^(ajax|feed|comments?|embed|amp|page)(\/|$)/i.test(rest)) {
+                return;
+            }
+            var spans = link.children("span");
+            var label = spans.eq(0).text().replace(/\s+/g, " ").trim();
+            var title = spans.eq(1).text().replace(/\s+/g, " ").trim();
+            var time = link.find("time").first();
+            if (!label && !time.length)
+                return; // bukan baris chapter
+            seen.add(path);
+            var fullName = label ? (title ? "".concat(label, ": ").concat(title) : label) : link.text();
+            rows.push({
+                name: cleanChapterName(fullName) || prettyChapterName(rest),
+                path: path,
+                releaseTime: time.attr("datetime") || time.text().trim() || undefined,
+            });
+        });
+        return rows;
+    };
+    // Daftar chapter: POST {novel, token, params} -> {html}. Grup 100 chapter per
+    // params.page; semua grup diikuti sesuai urutan situs (tanpa diurutkan ulang).
     MeioNovelCustomPlugin.prototype.chaptersViaApi = function (pageHtml_1, cleanPath_1, novelUrl_1) {
         return __awaiter(this, arguments, Promise, function (pageHtml, cleanPath, novelUrl, expectedTotal) {
             var attempt, chapters, fresh, firstPath, chapterUrl, chapterPage;
@@ -1074,10 +1108,10 @@ var MeioNovelCustomPlugin = /** @class */ (function () {
                 switch (_b.label) {
                     case 0:
                         attempt = function (html, referer) { return __awaiter(_this, void 0, Promise, function () {
-                            var $, csrf, url, makeBody, listX, list, readerX, first, found, pageNumbers, maxPage, log, stoppedEarly, page, res, merged, step, lastPath, lastNumber, res, merged;
-                            var _a, _b, _c;
-                            return __generator(this, function (_d) {
-                                switch (_d.label) {
+                            var $, csrf, url, makeBody, listX, list, readerX, first, firstHtml, rows, seen, addRows, pageNumbers, maxPage, totalMatch, apiTotal, groupMatch, groupSize, total, log, emptyRun, page, res, added;
+                            var _a, _b;
+                            return __generator(this, function (_c) {
+                                switch (_c.label) {
                                     case 0:
                                         $ = (0, cheerio_1.load)(html);
                                         csrf = $('meta[name="csrf-token"]').attr("content") || "";
@@ -1112,88 +1146,79 @@ var MeioNovelCustomPlugin = /** @class */ (function () {
                                         }
                                         return [4 /*yield*/, this.postJsonRetry(url, makeBody({}), csrf, referer)];
                                     case 1:
-                                        first = _d.sent();
+                                        first = _c.sent();
                                         if (first.status === 419)
                                             return [2 /*return*/, []];
                                         if (!first.ok || typeof ((_a = first.data) === null || _a === void 0 ? void 0 : _a.html) !== "string")
                                             return [2 /*return*/, []];
-                                        found = this.discoverChapters(first.data.html, cleanPath, []);
-                                        pageNumbers = (first.data.html.match(/(?:[?&]|&amp;)page=(\d+)/g) || []).concat(first.data.html.match(/data-page=["'](\d+)/g) || []).map(function (m) { return Number(m.replace(/\D/g, "")); });
-                                        maxPage = Math.max.apply(null, [1].concat(pageNumbers));
-                                        ["last_page", "total_pages", "pages", "page_count", "max_page"].forEach(function (key) {
-                                            var value = Number(first.data[key]);
-                                            if (value > maxPage)
-                                                maxPage = value;
+                                        firstHtml = first.data.html;
+                                        rows = [];
+                                        seen = new Set();
+                                        addRows = function (items) {
+                                            var added = 0;
+                                            items.forEach(function (item) {
+                                                if (seen.has(item.path))
+                                                    return;
+                                                seen.add(item.path);
+                                                rows.push(item);
+                                                added++;
+                                            });
+                                            return added;
+                                        };
+                                        addRows(this.parseListRows(firstHtml, cleanPath));
+                                        pageNumbers = [1];
+                                        (firstHtml.match(/[?&;]page=(\d+)/g) || []).forEach(function (m) {
+                                            return pageNumbers.push(Number(m.replace(/\D/g, "")));
                                         });
-                                        if (expectedTotal > found.length) {
-                                            maxPage = Math.max(maxPage, Math.ceil(expectedTotal / Math.max(1, found.length)));
-                                        }
-                                        log = ["p1:".concat(found.length, " max=").concat(maxPage)];
-                                        stoppedEarly = false;
+                                        (firstHtml.match(/Halaman\s+(\d+)/g) || []).forEach(function (m) {
+                                            return pageNumbers.push(Number(m.replace(/\D/g, "")));
+                                        });
+                                        maxPage = Math.max.apply(null, pageNumbers);
+                                        totalMatch = firstHtml.match(/dari\s+([\d.,]+)\s+chapter/i);
+                                        apiTotal = totalMatch ? Number(totalMatch[1].replace(/[.,]/g, "")) : 0;
+                                        groupMatch = firstHtml.match(/Grup\s+(\d+)\s*[–-]\s*(\d+)/);
+                                        groupSize = groupMatch
+                                            ? Math.max(1, Number(groupMatch[2]) - Number(groupMatch[1]) + 1)
+                                            : 100;
+                                        total = apiTotal || expectedTotal;
+                                        if (total)
+                                            maxPage = Math.max(maxPage, Math.ceil(total / groupSize));
+                                        log = [
+                                            "p1:".concat(rows.length, " max=").concat(maxPage, " total=").concat(total, " grup=").concat(groupSize),
+                                        ];
+                                        emptyRun = 0;
                                         page = 2;
-                                        _d.label = 2;
+                                        _c.label = 2;
                                     case 2:
-                                        if (!(page <= 800)) return [3 /*break*/, 6];
-                                        if (maxPage > 1 && page > maxPage)
-                                            return [3 /*break*/, 6];
-                                        if (expectedTotal && found.length >= expectedTotal)
-                                            return [3 /*break*/, 6];
-                                        return [4 /*yield*/, sleep(120)];
+                                        if (!(page <= Math.min(maxPage, 400))) return [3 /*break*/, 6];
+                                        return [4 /*yield*/, sleep(150)];
                                     case 3:
-                                        _d.sent();
+                                        _c.sent();
                                         return [4 /*yield*/, this.postJsonRetry(url, makeBody({ page: String(page) }), csrf, referer)];
                                     case 4:
-                                        res = _d.sent();
+                                        res = _c.sent();
                                         if (!res.ok || typeof ((_b = res.data) === null || _b === void 0 ? void 0 : _b.html) !== "string") {
                                             log.push("p".concat(page, ":st").concat(res.status));
-                                            stoppedEarly = true;
                                             return [3 /*break*/, 6];
                                         }
-                                        merged = this.discoverChapters(res.data.html, cleanPath, found);
-                                        if (merged.length <= found.length) {
-                                            log.push("p".concat(page, ":nogrow"));
-                                            stoppedEarly = maxPage <= 1 ? page === 2 : true;
-                                            return [3 /*break*/, 6];
+                                        added = addRows(this.parseListRows(res.data.html, cleanPath));
+                                        if (added === 0) {
+                                            emptyRun++;
+                                            log.push("p".concat(page, ":kosong"));
+                                            if (emptyRun >= 5)
+                                                return [3 /*break*/, 6]; // beberapa grup kosong berturut-turut
                                         }
-                                        found = merged;
-                                        _d.label = 5;
+                                        else {
+                                            emptyRun = 0;
+                                        }
+                                        _c.label = 5;
                                     case 5:
                                         page++;
                                         return [3 /*break*/, 2];
                                     case 6:
-                                        if (!(stoppedEarly &&
-                                            found.length >= 50 &&
-                                            (!expectedTotal || found.length < expectedTotal))) return [3 /*break*/, 11];
-                                        step = 0;
-                                        _d.label = 7;
-                                    case 7:
-                                        if (!(step < 800)) return [3 /*break*/, 11];
-                                        lastPath = found[found.length - 1].path;
-                                        lastNumber = chapterNumberOf(lastPath.slice("".concat(cleanPath, "/").length)) || found.length;
-                                        return [4 /*yield*/, sleep(120)];
-                                    case 8:
-                                        _d.sent();
-                                        return [4 /*yield*/, this.postJsonRetry(url, makeBody({ lompat: String(lastNumber + 1) }), csrf, referer)];
-                                    case 9:
-                                        res = _d.sent();
-                                        if (!res.ok || typeof ((_c = res.data) === null || _c === void 0 ? void 0 : _c.html) !== "string") {
-                                            log.push("j".concat(lastNumber + 1, ":st").concat(res.status));
-                                            return [3 /*break*/, 11];
-                                        }
-                                        merged = this.discoverChapters(res.data.html, cleanPath, found);
-                                        if (merged.length <= found.length) {
-                                            log.push("j".concat(lastNumber + 1, ":nogrow"));
-                                            return [3 /*break*/, 11];
-                                        }
-                                        found = merged;
-                                        _d.label = 10;
-                                    case 10:
-                                        step++;
-                                        return [3 /*break*/, 7];
-                                    case 11:
-                                        log.push("total=".concat(found.length));
+                                        log.push("total=".concat(rows.length));
                                         this.pagingLog = log.join(" ");
-                                        return [2 /*return*/, found];
+                                        return [2 /*return*/, rows.map(function (row, index) { return (__assign(__assign({}, row), { chapterNumber: index + 1 })); })];
                                 }
                             });
                         }); };
@@ -1338,7 +1363,7 @@ var MeioNovelCustomPlugin = /** @class */ (function () {
                                     : novelStatus_1.NovelStatus.Unknown;
                         summary = finalSummary;
                         if (this.pagingLog &&
-                            (expectedTotal > chapters.length || /nogrow|st\d/.test(this.pagingLog))) {
+                            (expectedTotal > chapters.length || /st\d/.test(this.pagingLog))) {
                             summary = "".concat(finalSummary || "", "\n\n[paging] ").concat(this.pagingLog, " expected=").concat(expectedTotal);
                         }
                         this.pagingLog = "";
