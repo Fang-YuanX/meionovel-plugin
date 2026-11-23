@@ -80,7 +80,11 @@ var getChapterPath = function (href) {
     return path.startsWith("novel/") ? path : undefined;
 };
 var isUsableUrl = function (url) {
-    return !!url && url.trim() !== "" && !/^data:/i.test(url.trim());
+    return !!url &&
+        url.trim() !== "" &&
+        !/^data:/i.test(url.trim()) &&
+        !/\.svg(\?|$)/i.test(url.trim()) &&
+        !/(placeholder|no[-_]?cover|default[-_]?cover|blank\.)/i.test(url.trim());
 };
 var absoluteUrl = function (url) {
     var value = url.trim();
@@ -95,15 +99,29 @@ var absoluteUrl = function (url) {
 var firstFromSrcset = function (srcset) { var _a; return (_a = srcset === null || srcset === void 0 ? void 0 : srcset.split(",")[0]) === null || _a === void 0 ? void 0 : _a.trim().split(/\s+/)[0]; };
 var getCover = function (element) {
     var image = element.find("img").first();
+    var extra = [];
+    element.find("source").each(function (_, source) {
+        extra.push(firstFromSrcset(element.find(source).attr("srcset")));
+    });
+    element.find("[style*='url(']").each(function (_, el) {
+        var style = element.find(el).attr("style") || "";
+        extra.push((style.match(/url\((['"]?)([^)'"]+)\1\)/) || [])[2]);
+    });
+    var noscript = element.find("noscript").first().html();
+    if (noscript)
+        extra.push((noscript.match(/<img[^>]+src=["']([^"']+)["']/i) || [])[1]);
     var found = [
         image.attr("data-lazy-src"),
         image.attr("data-src"),
+        image.attr("data-original"),
         image.attr("data-cfsrc"),
         firstFromSrcset(image.attr("data-lazy-srcset")),
         firstFromSrcset(image.attr("data-srcset")),
         firstFromSrcset(image.attr("srcset")),
         image.attr("src"),
-    ].find(isUsableUrl);
+    ]
+        .concat(extra)
+        .find(isUsableUrl);
     return found ? absoluteUrl(found) : undefined;
 };
 var CARD_SELECTOR = ".page-item-detail, .c-tabs-item__content, .novel-item, article";
@@ -541,7 +559,7 @@ var MeioNovelCustomPlugin = /** @class */ (function () {
         this.name = "MeioNovel Custom";
         this.icon = "src/id/meionovel/icon.png";
         this.site = SITE;
-        this.version = "3.1.5";
+        this.version = "3.1.6";
         this.imageRequestInit = {
             headers: { Referer: SITE },
         };
@@ -805,38 +823,41 @@ var MeioNovelCustomPlugin = /** @class */ (function () {
     };
     MeioNovelCustomPlugin.prototype.suggestNovels = function (searchTerm) {
         return __awaiter(this, void 0, Promise, function () {
-            var text, json, items, out;
+            var text, json, raw, items;
             return __generator(this, function (_a) {
                 switch (_a.label) {
                     case 0: return [4 /*yield*/, this.getText("".concat(SITE, "cari/saran?q=").concat(encodeURIComponent(searchTerm)), { Accept: "application/json", "X-Requested-With": "XMLHttpRequest" })];
                     case 1:
                         text = _a.sent();
                         if (!text)
-                            return [2 /*return*/, []];
+                            return [2 /*return*/, { items: [], allUrl: "" }];
                         try {
                             json = JSON.parse(text);
                         }
                         catch (error) {
-                            return [2 /*return*/, []];
+                            return [2 /*return*/, { items: [], allUrl: "" }];
                         }
-                        items = Array.isArray(json === null || json === void 0 ? void 0 : json.items) ? json.items : [];
-                        out = [];
-                        items.forEach(function (item) {
+                        raw = Array.isArray(json === null || json === void 0 ? void 0 : json.items) ? json.items : [];
+                        items = [];
+                        raw.forEach(function (item) {
                             var path = getNovelPath(String((item === null || item === void 0 ? void 0 : item.url) || ""));
                             var name = String((item === null || item === void 0 ? void 0 : item.title) || "").replace(/\s+/g, " ").trim();
                             if (!path || !name)
                                 return;
                             var cover = isUsableUrl(item === null || item === void 0 ? void 0 : item.cover) ? absoluteUrl(item.cover) : undefined;
-                            out.push({ name: name, path: path, cover: cover });
+                            items.push({ name: name, path: path, cover: cover });
                         });
-                        return [2 /*return*/, out];
+                        return [2 /*return*/, {
+                                items: items,
+                                allUrl: typeof (json === null || json === void 0 ? void 0 : json.all_url) === "string" ? json.all_url : "",
+                            }];
                 }
             });
         });
     };
     MeioNovelCustomPlugin.prototype.searchNovels = function (searchTerm, pageNo) {
         return __awaiter(this, void 0, Promise, function () {
-            var term, results, $, error_3, merged;
+            var term, results, suggest, base, pageUrl, $, error_3, merged;
             return __generator(this, function (_a) {
                 switch (_a.label) {
                     case 0:
@@ -844,26 +865,28 @@ var MeioNovelCustomPlugin = /** @class */ (function () {
                         if (!term)
                             return [2 /*return*/, []];
                         results = [];
-                        if (!(pageNo <= 1)) return [3 /*break*/, 2];
                         return [4 /*yield*/, this.suggestNovels(term)];
                     case 1:
-                        (_a.sent()).forEach(function (novel) { return results.push(novel); });
+                        suggest = _a.sent();
+                        // saran situs: judul + cover bersih (halaman pertama)
+                        if (pageNo <= 1)
+                            suggest.items.forEach(function (novel) { return results.push(novel); });
+                        base = suggest.allUrl
+                            ? absoluteUrl(suggest.allUrl)
+                            : "".concat(SITE, "jelajahi?q=").concat(encodeURIComponent(term));
+                        pageUrl = pageNo > 1 ? "".concat(base).concat(base.indexOf("?") >= 0 ? "&" : "?", "page=").concat(pageNo) : base;
                         _a.label = 2;
                     case 2:
                         _a.trys.push([2, 4, , 5]);
-                        return [4 /*yield*/, this.getHtml("".concat(SITE, "jelajahi?q=").concat(encodeURIComponent(term), "&page=").concat(pageNo))];
+                        return [4 /*yield*/, this.getHtml(pageUrl)];
                     case 3:
                         $ = (_a.sent()).$;
                         this.parseNovels($).forEach(function (novel) { return results.push(novel); });
                         return [3 /*break*/, 5];
                     case 4:
                         error_3 = _a.sent();
-                        if (pageNo > 1 || results.length) {
-                            // halaman habis atau tidak ada; pakai hasil yang sudah ada
-                        }
-                        else {
+                        if (!(pageNo > 1 || results.length))
                             throw error_3;
-                        }
                         return [3 /*break*/, 5];
                     case 5:
                         merged = new Map();
@@ -1300,18 +1323,21 @@ var MeioNovelCustomPlugin = /** @class */ (function () {
                 switch (_b.label) {
                     case 0:
                         attempt = function (html, referer) { return __awaiter(_this, void 0, Promise, function () {
-                            var $, csrf, url, makeBody, listX, list, readerX, first, firstHtml, rows, seen, addRows, pageNumbers, maxPage, totalMatch, apiTotal, groupMatch, groupSize, total, log, emptyRun, page, res, added, numbered, ordered;
-                            var _a, _b;
-                            return __generator(this, function (_c) {
-                                switch (_c.label) {
+                            var $, csrf, url, paramsOk, makeBody, listX, list, readerX, first, firstHtml, log, parseTotal, groupSizeOf, maxPageOf, lanes, $$_1, loadLane, tagged, seenPaths, collect, _a, i, _b, numbered, ordered;
+                            var _this = this;
+                            var _c;
+                            return __generator(this, function (_d) {
+                                switch (_d.label) {
                                     case 0:
                                         $ = (0, cheerio_1.load)(html);
                                         csrf = $('meta[name="csrf-token"]').attr("content") || "";
                                         url = "";
+                                        paramsOk = false;
                                         makeBody = function () { return ({}); };
                                         listX = $('[x-data*="chapterList"]').first().attr("x-data") || "";
                                         list = readXData(listX || html, ["url", "novel", "token"]);
                                         if (list.url && list.token && list.novel) {
+                                            paramsOk = true;
                                             url = absoluteUrl(list.url);
                                             makeBody = function (params) { return ({
                                                 novel: asIdValue(list.novel),
@@ -1338,92 +1364,172 @@ var MeioNovelCustomPlugin = /** @class */ (function () {
                                         }
                                         return [4 /*yield*/, this.postJsonRetry(url, makeBody({}), csrf, referer)];
                                     case 1:
-                                        first = _c.sent();
+                                        first = _d.sent();
                                         if (first.status === 419)
                                             return [2 /*return*/, []];
-                                        if (!first.ok || typeof ((_a = first.data) === null || _a === void 0 ? void 0 : _a.html) !== "string")
+                                        if (!first.ok || typeof ((_c = first.data) === null || _c === void 0 ? void 0 : _c.html) !== "string")
                                             return [2 /*return*/, []];
                                         firstHtml = first.data.html;
-                                        rows = [];
-                                        seen = new Set();
-                                        addRows = function (items) {
-                                            var added = 0;
-                                            items.forEach(function (item) {
-                                                if (seen.has(item.path))
-                                                    return;
-                                                seen.add(item.path);
-                                                rows.push(item);
-                                                added++;
-                                            });
-                                            return added;
+                                        log = [];
+                                        parseTotal = function (h) {
+                                            var m = h.match(/dari\s+([\d.,]+)\s+chapter/i);
+                                            return m ? Number(m[1].replace(/[.,]/g, "")) : 0;
                                         };
-                                        addRows(this.parseListRows(firstHtml, cleanPath));
-                                        pageNumbers = [1];
-                                        (firstHtml.match(/[?&;]page=(\d+)/g) || []).forEach(function (m) {
-                                            return pageNumbers.push(Number(m.replace(/\D/g, "")));
-                                        });
-                                        (firstHtml.match(/Halaman\s+(\d+)/g) || []).forEach(function (m) {
-                                            return pageNumbers.push(Number(m.replace(/\D/g, "")));
-                                        });
-                                        maxPage = Math.max.apply(null, pageNumbers);
-                                        totalMatch = firstHtml.match(/dari\s+([\d.,]+)\s+chapter/i);
-                                        apiTotal = totalMatch ? Number(totalMatch[1].replace(/[.,]/g, "")) : 0;
-                                        groupMatch = firstHtml.match(/Grup\s+(\d+)\s*[–-]\s*(\d+)/);
-                                        groupSize = groupMatch
-                                            ? Math.max(1, Number(groupMatch[2]) - Number(groupMatch[1]) + 1)
-                                            : 100;
-                                        total = apiTotal || expectedTotal;
-                                        if (total)
-                                            maxPage = Math.max(maxPage, Math.ceil(total / groupSize));
-                                        log = [
-                                            "p1:".concat(rows.length, " max=").concat(maxPage, " total=").concat(total, " grup=").concat(groupSize),
-                                        ];
-                                        emptyRun = 0;
-                                        page = 2;
-                                        _c.label = 2;
+                                        groupSizeOf = function (h) {
+                                            var m = h.match(/Grup\s+(\d+)\s*[–-]\s*(\d+)/);
+                                            return m ? Math.max(1, Number(m[2]) - Number(m[1]) + 1) : 100;
+                                        };
+                                        maxPageOf = function (h, fallbackCount) {
+                                            var nums = [1];
+                                            (h.match(/[?&;]page=(\d+)/g) || []).forEach(function (m) {
+                                                return nums.push(Number(m.replace(/\D/g, "")));
+                                            });
+                                            (h.match(/Halaman\s+(\d+)/g) || []).forEach(function (m) {
+                                                return nums.push(Number(m.replace(/\D/g, "")));
+                                            });
+                                            var max = Math.max.apply(null, nums);
+                                            var total = parseTotal(h) || fallbackCount || expectedTotal;
+                                            if (total)
+                                                max = Math.max(max, Math.ceil(total / groupSizeOf(h)));
+                                            return max;
+                                        };
+                                        lanes = [];
+                                        if (paramsOk) {
+                                            $$_1 = (0, cheerio_1.load)(firstHtml);
+                                            $$_1('a[href*="jalur="]').each(function (_, el) {
+                                                var href = $$_1(el).attr("href") || "";
+                                                var key = (href.match(/[?&;]jalur=([A-Za-z0-9_-]+)/) || [])[1];
+                                                if (!key || lanes.some(function (lane) { return lane.key === key; }))
+                                                    return;
+                                                var text = $$_1(el).text().replace(/\s+/g, " ").trim();
+                                                var countText = (text.match(/\(([\d.,]+)\)/) || [])[1] || "0";
+                                                lanes.push({
+                                                    key: key,
+                                                    name: text.replace(/\(.*$/, "").trim() || key.toUpperCase(),
+                                                    count: Number(countText.replace(/[.,]/g, "")),
+                                                });
+                                            });
+                                        }
+                                        loadLane = function (laneKey, laneName, laneCount, startHtml) { return __awaiter(_this, void 0, Promise, function () {
+                                            var rows, seen, addRows, paramsFor, h, res, maxPage, emptyRun, page, res, before;
+                                            var _this = this;
+                                            var _a, _b;
+                                            return __generator(this, function (_c) {
+                                                switch (_c.label) {
+                                                    case 0:
+                                                        rows = [];
+                                                        seen = new Set();
+                                                        addRows = function (h) {
+                                                            _this.parseListRows(h, cleanPath).forEach(function (row) {
+                                                                if (seen.has(row.path))
+                                                                    return;
+                                                                seen.add(row.path);
+                                                                rows.push(laneName ? __assign(__assign({}, row), { name: "".concat(row.name, " [").concat(laneName, "]") }) : row);
+                                                            });
+                                                        };
+                                                        paramsFor = function (page) {
+                                                            var params = {};
+                                                            if (laneKey)
+                                                                params.jalur = laneKey;
+                                                            if (page > 1)
+                                                                params.page = String(page);
+                                                            return params;
+                                                        };
+                                                        h = startHtml;
+                                                        if (!(h === null)) return [3 /*break*/, 2];
+                                                        return [4 /*yield*/, this.postJsonRetry(url, makeBody(paramsFor(1)), csrf, referer)];
+                                                    case 1:
+                                                        res = _c.sent();
+                                                        if (!res.ok || typeof ((_a = res.data) === null || _a === void 0 ? void 0 : _a.html) !== "string") {
+                                                            log.push("".concat(laneKey, ":st").concat(res.status));
+                                                            return [2 /*return*/, rows];
+                                                        }
+                                                        h = res.data.html;
+                                                        _c.label = 2;
+                                                    case 2:
+                                                        addRows(h);
+                                                        maxPage = maxPageOf(h, laneCount);
+                                                        emptyRun = 0;
+                                                        page = 2;
+                                                        _c.label = 3;
+                                                    case 3:
+                                                        if (!(page <= Math.min(maxPage, 400))) return [3 /*break*/, 7];
+                                                        return [4 /*yield*/, sleep(150)];
+                                                    case 4:
+                                                        _c.sent();
+                                                        return [4 /*yield*/, this.postJsonRetry(url, makeBody(paramsFor(page)), csrf, referer)];
+                                                    case 5:
+                                                        res = _c.sent();
+                                                        if (!res.ok || typeof ((_b = res.data) === null || _b === void 0 ? void 0 : _b.html) !== "string") {
+                                                            log.push("".concat(laneKey || "utama", ":p").concat(page, ":st").concat(res.status));
+                                                            return [3 /*break*/, 7];
+                                                        }
+                                                        before = rows.length;
+                                                        addRows(res.data.html);
+                                                        if (rows.length === before) {
+                                                            emptyRun++;
+                                                            if (emptyRun >= 5)
+                                                                return [3 /*break*/, 7];
+                                                        }
+                                                        else {
+                                                            emptyRun = 0;
+                                                        }
+                                                        _c.label = 6;
+                                                    case 6:
+                                                        page++;
+                                                        return [3 /*break*/, 3];
+                                                    case 7:
+                                                        log.push("".concat(laneKey || "utama", ":").concat(rows.length, "/").concat(maxPage, "p"));
+                                                        return [2 /*return*/, rows];
+                                                }
+                                            });
+                                        }); };
+                                        tagged = [];
+                                        seenPaths = new Set();
+                                        collect = function (rows, lane) {
+                                            return rows.forEach(function (row) {
+                                                if (seenPaths.has(row.path))
+                                                    return;
+                                                seenPaths.add(row.path);
+                                                tagged.push({ row: row, lane: lane });
+                                            });
+                                        };
+                                        _a = collect;
+                                        return [4 /*yield*/, loadLane(null, "", 0, firstHtml)];
                                     case 2:
-                                        if (!(page <= Math.min(maxPage, 400))) return [3 /*break*/, 6];
-                                        return [4 /*yield*/, sleep(150)];
+                                        _a.apply(void 0, [_d.sent(), 0]);
+                                        i = 0;
+                                        _d.label = 3;
                                     case 3:
-                                        _c.sent();
-                                        return [4 /*yield*/, this.postJsonRetry(url, makeBody({ page: String(page) }), csrf, referer)];
+                                        if (!(i < Math.min(lanes.length, 4))) return [3 /*break*/, 7];
+                                        return [4 /*yield*/, sleep(150)];
                                     case 4:
-                                        res = _c.sent();
-                                        if (!res.ok || typeof ((_b = res.data) === null || _b === void 0 ? void 0 : _b.html) !== "string") {
-                                            log.push("p".concat(page, ":st").concat(res.status));
-                                            return [3 /*break*/, 6];
-                                        }
-                                        added = addRows(this.parseListRows(res.data.html, cleanPath));
-                                        if (added === 0) {
-                                            emptyRun++;
-                                            log.push("p".concat(page, ":kosong"));
-                                            if (emptyRun >= 5)
-                                                return [3 /*break*/, 6]; // beberapa grup kosong berturut-turut
-                                        }
-                                        else {
-                                            emptyRun = 0;
-                                        }
-                                        _c.label = 5;
+                                        _d.sent();
+                                        _b = collect;
+                                        return [4 /*yield*/, loadLane(lanes[i].key, lanes[i].name, lanes[i].count, null)];
                                     case 5:
-                                        page++;
-                                        return [3 /*break*/, 2];
+                                        _b.apply(void 0, [_d.sent(), i + 1]);
+                                        _d.label = 6;
                                     case 6:
-                                        log.push("total=".concat(rows.length));
+                                        i++;
+                                        return [3 /*break*/, 3];
+                                    case 7:
                                         this.pagingLog = log.join(" ");
-                                        numbered = rows.filter(function (row) { return Number.isFinite(row.chapterNumber); }).length;
-                                        ordered = rows;
-                                        if (rows.length && numbered / rows.length >= 0.9) {
-                                            ordered = rows
-                                                .map(function (row, index) { return ({ row: row, index: index }); })
-                                                .sort(function (a, b) {
-                                                return (Number.isFinite(a.row.chapterNumber) && Number.isFinite(b.row.chapterNumber)
+                                        numbered = tagged.filter(function (item) {
+                                            return Number.isFinite(item.row.chapterNumber);
+                                        }).length;
+                                        ordered = tagged.map(function (item, index) { return (__assign(__assign({}, item), { index: index })); });
+                                        if (tagged.length && numbered / tagged.length >= 0.9) {
+                                            ordered = ordered.sort(function (a, b) {
+                                                return ((Number.isFinite(a.row.chapterNumber) && Number.isFinite(b.row.chapterNumber)
                                                     ? a.row.chapterNumber - b.row.chapterNumber
-                                                    : 0) || a.index - b.index;
-                                            })
-                                                .map(function (entry) { return entry.row; });
+                                                    : 0) ||
+                                                    a.lane - b.lane ||
+                                                    a.index - b.index);
+                                            });
                                         }
-                                        return [2 /*return*/, ordered.map(function (row, index) { return (__assign(__assign({}, row), { chapterNumber: Number.isFinite(row.chapterNumber)
-                                                    ? row.chapterNumber
+                                        return [2 /*return*/, ordered.map(function (item, index) { return (__assign(__assign({}, item.row), { chapterNumber: Number.isFinite(item.row.chapterNumber)
+                                                    ? item.row.chapterNumber
                                                     : index + 1 })); })];
                                 }
                             });
