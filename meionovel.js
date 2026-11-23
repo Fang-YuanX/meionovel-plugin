@@ -541,7 +541,7 @@ var MeioNovelCustomPlugin = /** @class */ (function () {
         this.name = "MeioNovel Custom";
         this.icon = "src/id/meionovel/icon.png";
         this.site = SITE;
-        this.version = "3.1.4";
+        this.version = "3.1.5";
         this.imageRequestInit = {
             headers: { Referer: SITE },
         };
@@ -1275,10 +1275,15 @@ var MeioNovelCustomPlugin = /** @class */ (function () {
                 return; // bukan baris chapter
             seen.add(path);
             var fullName = label ? (title ? "".concat(label, ": ").concat(title) : label) : link.text();
+            var labelNumber = label.match(/(\d+(?:[.,]\d+)?)/);
+            var number = labelNumber
+                ? Number(labelNumber[1].replace(",", "."))
+                : chapterNumberOf(rest);
             rows.push({
                 name: cleanChapterName(fullName) || prettyChapterName(rest),
                 path: path,
                 releaseTime: time.attr("datetime") || time.text().trim() || undefined,
+                chapterNumber: number,
             });
         });
         return rows;
@@ -1295,7 +1300,7 @@ var MeioNovelCustomPlugin = /** @class */ (function () {
                 switch (_b.label) {
                     case 0:
                         attempt = function (html, referer) { return __awaiter(_this, void 0, Promise, function () {
-                            var $, csrf, url, makeBody, listX, list, readerX, first, firstHtml, rows, seen, addRows, pageNumbers, maxPage, totalMatch, apiTotal, groupMatch, groupSize, total, log, emptyRun, page, res, added;
+                            var $, csrf, url, makeBody, listX, list, readerX, first, firstHtml, rows, seen, addRows, pageNumbers, maxPage, totalMatch, apiTotal, groupMatch, groupSize, total, log, emptyRun, page, res, added, numbered, ordered;
                             var _a, _b;
                             return __generator(this, function (_c) {
                                 switch (_c.label) {
@@ -1405,7 +1410,21 @@ var MeioNovelCustomPlugin = /** @class */ (function () {
                                     case 6:
                                         log.push("total=".concat(rows.length));
                                         this.pagingLog = log.join(" ");
-                                        return [2 /*return*/, rows.map(function (row, index) { return (__assign(__assign({}, row), { chapterNumber: index + 1 })); })];
+                                        numbered = rows.filter(function (row) { return Number.isFinite(row.chapterNumber); }).length;
+                                        ordered = rows;
+                                        if (rows.length && numbered / rows.length >= 0.9) {
+                                            ordered = rows
+                                                .map(function (row, index) { return ({ row: row, index: index }); })
+                                                .sort(function (a, b) {
+                                                return (Number.isFinite(a.row.chapterNumber) && Number.isFinite(b.row.chapterNumber)
+                                                    ? a.row.chapterNumber - b.row.chapterNumber
+                                                    : 0) || a.index - b.index;
+                                            })
+                                                .map(function (entry) { return entry.row; });
+                                        }
+                                        return [2 /*return*/, ordered.map(function (row, index) { return (__assign(__assign({}, row), { chapterNumber: Number.isFinite(row.chapterNumber)
+                                                    ? row.chapterNumber
+                                                    : index + 1 })); })];
                                 }
                             });
                         }); };
@@ -1549,10 +1568,6 @@ var MeioNovelCustomPlugin = /** @class */ (function () {
                                     ? novelStatus_1.NovelStatus.OnHiatus
                                     : novelStatus_1.NovelStatus.Unknown;
                         summary = finalSummary;
-                        if (this.pagingLog &&
-                            (expectedTotal > chapters.length || /st\d/.test(this.pagingLog))) {
-                            summary = "".concat(finalSummary || "", "\n\n[paging] ").concat(this.pagingLog, " expected=").concat(expectedTotal);
-                        }
                         this.pagingLog = "";
                         return [2 /*return*/, {
                                 path: novelPath,
